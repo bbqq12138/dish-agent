@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class GenerationIntegrationModule:
     """生成集成模块 - 负责LLM集成和回答生成"""
     
-    def __init__(self, model_name: str = "kimi-k2-0711-preview", temperature: float = 0.1, max_tokens: int = 2048):
+    def __init__(self, model_name: str = "kimi-k2-0905-preview", temperature: float = 0.1, max_tokens: int = 2048):
         """
         初始化生成集成模块
         
