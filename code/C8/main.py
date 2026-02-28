@@ -104,13 +104,9 @@ class RecipeRAGSystem:
             print("进行文本分块...")
             chunks = self.data_module.chunk_documents()
 
-            # 4. 构建向量索引
-            print("构建向量索引...")
-            vectorstore = self.index_module.build_vector_index(chunks)
-
-            # 5. 保存索引
-            print("保存向量索引...")
-            self.index_module.save_index()
+            # 4. 构建并保存向量索引
+            print("构建并保存向量索引...")
+            vectorstore = self.index_module.build_vector_index(chunks, is_persist=True)
 
         # 6. 初始化检索优化模块
         print("初始化检索优化...")
@@ -158,27 +154,27 @@ class RecipeRAGSystem:
         
         # 3. 检索相关子块（自动应用元数据过滤）
         print("🔍 检索相关文档...")
-        filters = self._extract_filters_from_query(question)
-        if filters:
-            print(f"应用过滤条件: {filters}")
-            relevant_chunks = self.retrieval_module.metadata_filtered_search(rewritten_query, filters, top_k=self.config.top_k)
-        else:
-            relevant_chunks = self.retrieval_module.hybrid_search(rewritten_query, top_k=self.config.top_k)
+        relevant_chunks = self.retrieval_module.all_retrieval(rewritten_query)  # 全检索，自动结合元数据过滤和混合检索
+        
+        # 对检索结果进行重排
+        relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks)  
+
+        # if filters:
+        #     print(f"应用过滤条件: {filters}")
+        #     relevant_chunks = self.retrieval_module.metadata_filtered_search(rewritten_query, filters, top_k=self.config.top_k)
+        # else:
+        #     relevant_chunks = self.retrieval_module.hybrid_search(rewritten_query, top_k=self.config.top_k)
 
         # 显示检索到的子块信息
         if relevant_chunks:
             chunk_info = []
             for chunk in relevant_chunks:
                 dish_name = chunk.metadata.get('dish_name', '未知菜品')
-                # 尝试从内容中提取章节标题
-                content_preview = chunk.page_content[:100].strip()
-                if content_preview.startswith('#'):
-                    # 如果是标题开头，提取标题（仅取第一行）
-                    title_end = content_preview.find('\n') if '\n' in content_preview else len(content_preview)
-                    section_title = content_preview[:title_end].replace('#', '').strip()
-                    chunk_info.append(f"{dish_name}({section_title})")
-                else:
-                    chunk_info.append(f"{dish_name}(内容片段)")
+                title = []
+                for t in ['主标题', '二级标题', '三级标题']:
+                    if chunk.metadata.get(t):
+                        title.append(chunk.metadata.get(t))
+                chunk_info.append(f"{dish_name}({'-'.join(title)})")
 
             print(f"找到 {len(relevant_chunks)} 个相关文档块: {', '.join(chunk_info)}")
         else:
@@ -236,6 +232,7 @@ class RecipeRAGSystem:
                 else:
                     return self.generation_module.generate_basic_answer(question, relevant_docs)
     
+
     def _extract_filters_from_query(self, query: str) -> dict:
         """
         从用户问题中提取元数据过滤条件

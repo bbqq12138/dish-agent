@@ -11,7 +11,7 @@ class RAGConfig:
 
     # 路径配置
     data_path: str = "../../data/C8/cook"
-    index_save_path: str = "./vector_index"
+    index_save_path: str = "./chroma_vector_index"
 
     # 模型配置
     embedding_model: str = "BAAI/bge-small-zh-v1.5"

@@ -60,6 +60,7 @@ rag/
 *.ckpt
 *.pkl
 *.faiss
+*vector_index
 
 # Cache
 .cache/
