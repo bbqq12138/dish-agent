@@ -18,7 +18,7 @@ class RAGConfig:
     llm_model: str = "kimi-k2-0905-preview"
 
     # 检索配置
-    top_k: int = 3
+    top_k: int = 5
 
     # 生成配置
     temperature: float = 0.1

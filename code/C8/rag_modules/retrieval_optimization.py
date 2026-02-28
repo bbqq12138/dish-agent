@@ -41,6 +41,7 @@ class RetrievalOptimizationModule:
         self.vectorstore = vectorstore
         self.chunks = chunks
         self.llm = None
+        self.reranker_model = None
         self.reranker = None
         self.setup_retrievers()
 
@@ -114,22 +115,15 @@ class RetrievalOptimizationModule:
             search_kwargs={"k": 5}  # 控制检索器检索结果数量
         )
 
-        # 初始化重排模型
-        reranker_model = HuggingFaceCrossEncoder(
+        # 4. 初始化重排模型
+        self.reranker_model = HuggingFaceCrossEncoder(
             model_name='BAAI/bge-reranker-v2-m3', 
             model_kwargs={
                 'device': 'cpu',
                 'cache_folder': '/tmp/huggingface_cache',  # 指定缓存目录，避免默认位置磁盘空间不足
             }
         )
-
-        # 4. 初始化重排器，设置top_n=5表示每个候选文档最多返回5个与查询相关的文档对
-        self.reranker = CrossEncoderReranker(
-            model=reranker_model,
-            top_n=5
-        )
             
-
         logger.info("检索器设置完成")
     
     def hybrid_search(self, query: str, top_k: int = 3, weight=[0.4, 0.6]) -> List[Document]:
@@ -158,14 +152,30 @@ class RetrievalOptimizationModule:
         """
         return self.self_query_retriever.invoke(query)
 
-    def rerank(self, query: str, candidate_docs: List[Document]) -> List[Document]:
+    def rerank(self, query: str, candidate_docs: List[Document], top_k: int=5) -> List[Document]:
         """
         对候选文档进行重排，这里简单使用LLM对候选文档进行打分，并根据分数进行排序，选择前5个文档返回
         由于原本的documents的page_content不包含标题等元数据，我们可以在这里把文档内容和元数据拼接起来，形成新的文本输入给重排模型
         若不在文本中载入元数据，reranker得出的结果可能不太准确
         PS：这里先不弄了，以后再弄
         """
-        reranked_docs = self.reranker.compress_documents(candidate_docs, query)
+        text_pairs = []
+        for doc in candidate_docs:
+            text_pairs.append((query, doc.page_content))
+        scores = self.reranker_model.score(text_pairs)
+        scores = [(score, i) for i, score in enumerate(scores)]
+        scores.sort(reverse=True, key=(lambda x: x[0]))
+
+        reranked_docs = []
+        count = 0
+        for score, seq in scores:
+            if score < 0.6:     # 这里设置一个排序模型的分数阈值，只有当文档与查询的相关性得分超过0.6时才被认为是相关的，才会被加入到重排结果中
+                continue
+            reranked_docs.append(candidate_docs[seq])
+            count += 1
+            if count >= top_k:
+                break
+
         # logger.info(f"重排完成: 输入候选文档{len(candidate_docs)}个, 输出重排后文档{len(reranked_docs)}个")
         return reranked_docs
 

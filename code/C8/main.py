@@ -157,7 +157,7 @@ class RecipeRAGSystem:
         relevant_chunks = self.retrieval_module.all_retrieval(rewritten_query)  # 全检索，自动结合元数据过滤和混合检索
         
         # 对检索结果进行重排
-        relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks)  
+        relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k)  
 
         # if filters:
         #     print(f"应用过滤条件: {filters}")
