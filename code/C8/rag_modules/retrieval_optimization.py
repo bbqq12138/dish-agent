@@ -152,7 +152,7 @@ class RetrievalOptimizationModule:
         """
         return self.self_query_retriever.invoke(query)
 
-    def rerank(self, query: str, candidate_docs: List[Document], top_k: int=5) -> List[Document]:
+    def rerank(self, query: str, candidate_docs: List[Document], top_k: int=5, threshold: float=0.6) -> List[Document]:
         """
         对候选文档进行重排，这里简单使用LLM对候选文档进行打分，并根据分数进行排序，选择前5个文档返回
         由于原本的documents的page_content不包含标题等元数据，我们可以在这里把文档内容和元数据拼接起来，形成新的文本输入给重排模型
@@ -169,7 +169,7 @@ class RetrievalOptimizationModule:
         reranked_docs = []
         count = 0
         for score, seq in scores:
-            if score < 0.6:     # 这里设置一个排序模型的分数阈值，只有当文档与查询的相关性得分超过0.6时才被认为是相关的，才会被加入到重排结果中
+            if score < threshold:     # 这里设置一个排序模型的分数阈值，只有当文档与查询的相关性得分超过threshold时才被认为是相关的，才会被加入到重排结果中
                 continue
             reranked_docs.append(candidate_docs[seq])
             count += 1
