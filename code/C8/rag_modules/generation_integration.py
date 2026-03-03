@@ -306,8 +306,8 @@ class GenerationIntegrationModule:
             | StrOutputParser()
         )
 
-        for chunk in chain.stream(query):
-            yield chunk
+        for chunk in chain.stream(query):   # stream方法会返回一个生成器，逐步输出回答内容
+            yield chunk                     # yield替代return，使函数成为一个生成器，允许逐步输出回答片段（return只能返回一次，yield可以多次返回）
 
     def generate_step_by_step_answer_stream(self, query: str, context_docs: List[Document]):
         """
@@ -361,13 +361,13 @@ class GenerationIntegrationModule:
         for chunk in chain.stream(query):
             yield chunk
 
-    def _build_context(self, docs: List[Document], max_length: int = 2000) -> str:
+    def _build_context(self, docs: List[Document], max_length: int = 5000) -> str:
         """
         构建上下文字符串
         
         Args:
             docs: 文档列表
-            max_length: 最大长度
+            max_length: 最大长度，超过后会截断，2000大概两个食谱，设置5000可以保证大概4-5个食谱的完整信息
             
         Returns:
             格式化的上下文字符串
@@ -393,6 +393,7 @@ class GenerationIntegrationModule:
             
             # 检查长度限制
             if current_length + len(doc_text) > max_length:
+                logger.info(f"达到上下文长度限制，已添加 {i-1} 条食谱信息")
                 break
             
             context_parts.append(doc_text)
