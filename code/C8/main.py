@@ -157,7 +157,11 @@ class RecipeRAGSystem:
         relevant_chunks = self.retrieval_module.all_retrieval(rewritten_query)  # 全检索，自动结合元数据过滤和混合检索
         
         # 对检索结果进行重排
-        relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k)  
+        if route_type == 'list':
+            # 列表查询更注重相关性和覆盖度，使用较宽松的重排策略
+            relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k, threshold=0)  # 列表查询不能使用reranker阈值过滤结果，因为分数都不会太高
+        else:
+            relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k, threshold=0.6)  # 一般和详细查询使用默认阈值
 
         # if filters:
         #     print(f"应用过滤条件: {filters}")
@@ -181,6 +185,7 @@ class RecipeRAGSystem:
             print(f"找到 {len(relevant_chunks)} 个相关文档块")
 
         # 4. 检查是否找到相关内容
+        # 由reranker模型过滤相关文档，若没有相关文档则直接返回提示信息
         if not relevant_chunks:
             return "抱歉，没有找到相关的食谱信息。请尝试其他菜品名称或关键词。"
 
