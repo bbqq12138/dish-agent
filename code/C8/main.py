@@ -160,8 +160,10 @@ class RecipeRAGSystem:
         if route_type == 'list':
             # 列表查询更注重相关性和覆盖度，使用较宽松的重排策略
             relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k, threshold=0)  # 列表查询不能使用reranker阈值过滤结果，因为分数都不会太高
+        elif route_type == 'general':
+            relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k, threshold=0.2)  # 一般查询使用较宽松的阈值，允许更多相关信息进入生成阶段，提升回答的丰富度和实用性
         else:
-            relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k, threshold=0.6)  # 一般和详细查询使用默认阈值
+            relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k, threshold=0.5)  # 详细查询使用较高阈值，确保信息高度相关
 
         # if filters:
         #     print(f"应用过滤条件: {filters}")
