@@ -14,7 +14,7 @@ class RAGConfig:
     index_save_path: str = "./chroma_vector_index"
 
     # 模型配置
-    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    embedding_model: str = "BAAI/bge-large-zh-v1.5"
     llm_model: str = "kimi-k2-0905-preview"
 
     # 检索配置

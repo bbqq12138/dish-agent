@@ -11,12 +11,10 @@ from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
-from langchain.retrievers.self_query.base import SelfQueryRetriever
-from langchain.chains.query_constructor.base import AttributeInfo
-from langchain_community.chat_models.moonshot import MoonshotChat
+from langchain_classic.chains.query_constructor.schema import AttributeInfo
+from langchain_classic.retrievers.self_query.base import SelfQueryRetriever
 
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders.huggingface import HuggingFaceCrossEncoder
 
 
 logger = logging.getLogger(__name__)
@@ -30,7 +28,7 @@ class RetrievalOptimizationModule:
     """
     
     
-    def __init__(self, vectorstore: Chroma, chunks: List[Document]):
+    def __init__(self, vectorstore: Chroma, chunks: List[Document], llm):
         """
         初始化检索优化模块
         
@@ -40,7 +38,7 @@ class RetrievalOptimizationModule:
         """
         self.vectorstore = vectorstore
         self.chunks = chunks
-        self.llm = None
+        self.llm = llm
         self.reranker_model = None
         self.reranker = None
         self.setup_retrievers()
@@ -60,14 +58,6 @@ class RetrievalOptimizationModule:
             documents=self.chunks,
             preprocess_func=self._jieba_tokenizer,  # 关键就在这一行！
             k=5
-        )
-
-        # 初始化 MoonshotChat 作为 LLM，用于后续的自检索器等功能
-        llm = MoonshotChat(
-            model="kimi-k2-0905-preview", 
-            temperature=0, 
-            max_tokens=1024, 
-            api_key=os.getenv("MOONSHOT_API_KEY"), 
         )
 
         # 定义元数据字段信息，供自检索器使用
@@ -106,7 +96,7 @@ class RetrievalOptimizationModule:
 
         # 3.初始化自检索器，允许大模型自己决定返回数量，并在控制台打印出模型生成的查询
         self.self_query_retriever = SelfQueryRetriever.from_llm(
-            llm=llm, 
+            llm=self.llm, 
             vectorstore=self.vectorstore,
             document_contents="各种菜的菜谱", 
             metadata_field_info=metadata_field_info, 

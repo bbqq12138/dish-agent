@@ -7,6 +7,9 @@ import sys
 import logging
 from pathlib import Path
 from typing import List
+from huggingface_hub import login
+from langchain.chat_models import init_chat_model
+
 
 # 添加模块路径
 sys.path.append(str(Path(__file__).parent))
@@ -26,9 +29,19 @@ load_dotenv()
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    # format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(message)s',
 )
 logger = logging.getLogger(__name__)
+
+# 降低第三方库的日志级别，只显示警告和错误
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("langchain").setLevel(logging.WARNING)
+logging.getLogger("jieba").setLevel(logging.WARNING)
+
+# 登录Hugging Face Hub（如果需要）
+login(token=os.getenv("HF_TOKEN"))
 
 class RecipeRAGSystem:
     """食谱RAG系统主类"""
@@ -45,6 +58,7 @@ class RecipeRAGSystem:
         self.index_module = None
         self.retrieval_module = None
         self.generation_module = None
+        self.llm = None
 
         # 检查数据路径
         if not Path(self.config.data_path).exists():
@@ -57,6 +71,10 @@ class RecipeRAGSystem:
     def initialize_system(self):
         """初始化所有模块"""
         print("🚀 正在初始化RAG系统...")
+
+         # 0.初始化llm
+        print("初始化llm...")
+        self._setup_llm(self.config.llm_model)
 
         # 1. 初始化数据准备模块
         print("初始化数据准备模块...")
@@ -71,13 +89,26 @@ class RecipeRAGSystem:
 
         # 3. 初始化生成集成模块
         print("🤖 初始化生成集成模块...")
-        self.generation_module = GenerationIntegrationModule(
-            model_name=self.config.llm_model,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens
-        )
+        self.generation_module = GenerationIntegrationModule(llm=self.llm)
 
         print("✅ 系统初始化完成！")
+
+
+    def _setup_llm(self, model_name: str = "kimi-k2-0905-preview", temperature: float = 0.1, max_tokens: int = 2048):
+        """初始化大语言模型"""
+        logger.info(f"正在初始化LLM: {model_name}")
+
+        api_key = os.getenv("MOONSHOT_API_KEY")
+        if not api_key:
+            raise ValueError("请设置 MOONSHOT_API_KEY 环境变量")
+
+        self.llm = init_chat_model(
+            model="kimi-k2-0905-preview",
+            model_provider='openai',
+            api_key='sk-0LKqKgyZwPsTYRY3UB3oecfMFpRagrA3oCCxa0gGF9JqGIAe',
+            base_url='https://api.moonshot.cn/v1',
+        )
+
     
     def build_knowledge_base(self):
         """构建知识库"""
@@ -110,7 +141,7 @@ class RecipeRAGSystem:
 
         # 6. 初始化检索优化模块
         print("初始化检索优化...")
-        self.retrieval_module = RetrievalOptimizationModule(vectorstore, chunks)
+        self.retrieval_module = RetrievalOptimizationModule(vectorstore, chunks, self.llm)
 
         # 7. 显示统计信息
         stats = self.data_module.get_statistics()
