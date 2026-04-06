@@ -7,6 +7,7 @@ import logging
 from typing import List
 
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.messages import SystemMessage
 from langchain_community.chat_models.moonshot import MoonshotChat
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnablePassthrough
@@ -189,17 +190,29 @@ class GenerationIntegrationModule:
         Returns:
             路由类型 ('list', 'detail', 'general')
         """
+        
         prompt = ChatPromptTemplate.from_template("""
 根据用户的问题，将其分类为以下三种类型之一：
 
-1. 'list' - 用户想要获取菜品列表或推荐，只需要菜名
-   例如：推荐几个素菜、有什么川菜、给我3个简单的菜
-
-2. 'detail' - 用户想要具体的制作方法或详细信息
-   例如：宫保鸡丁怎么做、制作步骤、需要什么食材
-
-3. 'general' - 其他一般性问题
-   例如：什么是川菜、制作技巧、营养价值
+1. 'list'：用户想要获取菜品列表或推荐，只需要菜名
+   例如：
+    - 推荐几个素菜
+    - 与茄子相关的菜有什么
+    - 今天外面下雪了，吃什么菜好呢？
+    - 我最近血糖有些高，有什么适合吃的菜吗？
+                                                  
+2. 'detail'：用户想要具体的制作方法或详细信息
+   例如：
+    - 宫保鸡丁怎么做                                          
+    - 宫保鸡丁的制作步骤、需要什么食材
+    - 宫保鸡丁的制作技巧
+                                                  
+3. 'general'：其他一般性问题
+   例如：
+    - 什么是川菜
+    - 宫保鸡丁的卡路里多少
+    - 做菜的基本技巧有哪些
+    - 如何判断菜是否熟了
 
 请只返回分类结果：list、detail 或 general
 
@@ -250,6 +263,24 @@ class GenerationIntegrationModule:
             return f"为您推荐以下菜品：\n" + "\n".join([f"{i+1}. {name}" for i, name in enumerate(dish_names)])
         else:
             return f"为您推荐以下菜品：\n" + "\n".join([f"{i+1}. {name}" for i, name in enumerate(dish_names[:3])]) + f"\n\n还有其他 {len(dish_names)-3} 道菜品可供选择。"
+        
+#         dish_context = "\n\n".join(list(doc.page_content for doc in context_docs))
+#         list_answer_prompt = f"""你是一个菜品推荐助手。根据用户的提问和相关的菜品资料，生成一个简洁的推荐列表回答。
+
+# 格式：
+# 1. 菜品名称1。理由（可选）
+# 2. 菜品名称2。理由（可选）
+# 3. 菜品名称3。理由（可选）
+# 还有其他X道菜品可供选择。
+
+# 要求：
+#  - 请严格按照上述格式生成回答
+#  - 根据用户的要求和资料选择其中最相关的菜品，如果相关菜品较多，推荐最相关的前3个，并提示还有其他X道菜品可供选择
+#  - 推荐理由可以简短说明，当不需要理由时可以省略
+
+# 用户问题: {query}
+# 相关菜品信息:
+# {context}"""
 
     def generate_basic_answer_stream(self, query: str, context_docs: List[Document]):
         """

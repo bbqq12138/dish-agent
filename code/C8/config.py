@@ -3,7 +3,12 @@ RAG系统配置文件
 """
 
 from dataclasses import dataclass
+from dotenv import load_dotenv
+import os
 from typing import Dict, Any
+
+load_dotenv()
+
 
 @dataclass
 class RAGConfig:
@@ -11,11 +16,23 @@ class RAGConfig:
 
     # 路径配置
     data_path: str = "../../data/C8/cook"
-    index_save_path: str = "./chroma_vector_index"
+
+    # 向量数据库配置
+    collection_name: str = "RecipeChunk"
+    qdrant_url: str = "http://localhost:6334"
 
     # 模型配置
     embedding_model: str = "BAAI/bge-large-zh-v1.5"
-    llm_model: str = "kimi-k2-0905-preview"
+    llm_model: str | None = os.getenv('MOONSHOT_MODEL_ID')
+    hyde_llm_config = {
+        'model_name': os.getenv('MOONSHOT_MODEL_FAST'), 
+        'temperature': 0.4,
+    }
+    reranker_config = {
+        'model_name': 'BAAI/bge-reranker-v2-m3',
+        'use_fp16': True, 
+        'cache_dir': '/tmp/reranker-model/', 
+    }
 
     # 检索配置
     top_k: int = 5
@@ -37,7 +54,8 @@ class RAGConfig:
         """转换为字典"""
         return {
             'data_path': self.data_path,
-            'index_save_path': self.index_save_path,
+            'qdrant_url': self.qdrant_url,
+            'collection_name': self.collection_name,
             'embedding_model': self.embedding_model,
             'llm_model': self.llm_model,
             'top_k': self.top_k,

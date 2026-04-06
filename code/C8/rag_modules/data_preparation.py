@@ -154,9 +154,8 @@ class DataPreparationModule:
 
         # 为每个chunk添加基础元数据
         for i, chunk in enumerate(chunks):
-            if 'chunk_id' not in chunk.metadata:
-                # 如果没有chunk_id（比如分割失败的情况），则生成一个
-                chunk.metadata['chunk_id'] = str(uuid.uuid4())
+            chunk_flag = chunk.page_content[:50]  # 取内容前50字符作为标识
+            chunk.metadata['chunk_id'] = hashlib.md5(chunk_flag.encode("utf-8")).hexdigest()  # 基于内容生成稳定的chunk_id，避免每次运行都变化
             chunk.metadata['batch_index'] = i  # 在当前批次中的索引
             chunk.metadata['chunk_size'] = len(chunk.page_content)
 
@@ -312,12 +311,25 @@ class DataPreparationModule:
         
         logger.info(f"元数据已导出到: {output_path}")
 
-    def get_parent_documents(self, child_chunks: List[Document]) -> List[Document]:
+    def get_chunks(self, chunk_ids: List[str]) -> List[Document]:
         """
-        根据子块获取对应的父文档（智能去重）
+        根据chunk_id获取对应的子块文档
+        
+        Args:
+            chunk_ids: 子块ID列表
+            
+        Returns:
+            对应的子块文档列表
+        """
+        chunk_map = {chunk.metadata.get('chunk_id'): chunk for chunk in self.chunks}
+        return [chunk_map[chunk_id] for chunk_id in chunk_ids if chunk_id in chunk_map]
+
+    def get_documents(self, parent_ids: List[str]) -> List[Document]:
+        """
+        根据子块返回的父文档ids来获取对应的父文档（智能去重）
 
         Args:
-            child_chunks: 检索到的子块列表
+            parent_ids: 父文档ID列表
 
         Returns:
             对应的父文档列表（去重，按相关性排序）
@@ -327,8 +339,7 @@ class DataPreparationModule:
         parent_docs_map = {}
 
         # 收集所有相关的父文档ID和相关性分数
-        for chunk in child_chunks:
-            parent_id = chunk.metadata.get("parent_id")
+        for parent_id in parent_ids:
             if parent_id:
                 # 增加相关性计数
                 parent_relevance[parent_id] = parent_relevance.get(parent_id, 0) + 1
@@ -359,5 +370,5 @@ class DataPreparationModule:
             relevance_count = parent_relevance.get(parent_id, 0)
             parent_info.append(f"{dish_name}({relevance_count}块)")
 
-        logger.info(f"从 {len(child_chunks)} 个子块中找到 {len(parent_docs)} 个去重父文档: {', '.join(parent_info)}")
+        logger.info(f"从 {len(parent_ids)} 个子块中找到 {len(parent_docs)} 个去重父文档: {', '.join(parent_info)}")
         return parent_docs

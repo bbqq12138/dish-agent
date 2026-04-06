@@ -4,7 +4,6 @@ RAG系统主程序
 
 import os
 import sys
-import asyncio
 import logging
 from pathlib import Path
 from typing import List
@@ -47,7 +46,7 @@ login(token=os.getenv("HF_TOKEN"))
 class RecipeRAGSystem:
     """食谱RAG系统主类"""
 
-    def __init__(self, config: RAGConfig | None = None):
+    def __init__(self, config: RAGConfig = None):
         """
         初始化RAG系统
 
@@ -55,10 +54,10 @@ class RecipeRAGSystem:
             config: RAG系统配置，默认使用DEFAULT_CONFIG
         """
         self.config = config or DEFAULT_CONFIG
-        self.data_module: DataPreparationModule | None = None
-        self.index_module: IndexConstructionModule | None = None
-        self.retrieval_module: RetrievalOptimizationModule | None = None
-        self.generation_module: GenerationIntegrationModule | None = None
+        self.data_module = None
+        self.index_module = None
+        self.retrieval_module = None
+        self.generation_module = None
         self.llm = None
 
         # 检查数据路径
@@ -75,7 +74,7 @@ class RecipeRAGSystem:
 
          # 0.初始化llm
         print("初始化llm...")
-        self._setup_llm()
+        self._setup_llm(self.config.llm_model)
 
         # 1. 初始化数据准备模块
         print("初始化数据准备模块...")
@@ -84,9 +83,8 @@ class RecipeRAGSystem:
         # 2. 初始化索引构建模块
         print("初始化索引构建模块...")
         self.index_module = IndexConstructionModule(
-            dense_model_name=self.config.embedding_model,
-            collection_name=self.config.collection_name,
-            qdrant_url=self.config.qdrant_url
+            model_name=self.config.embedding_model,
+            index_save_path=self.config.index_save_path
         )
 
         # 3. 初始化生成集成模块
@@ -96,36 +94,36 @@ class RecipeRAGSystem:
         print("✅ 系统初始化完成！")
 
 
-    def _setup_llm(self):
+    def _setup_llm(self, model_name: str = "kimi-k2-0905-preview", temperature: float = 0.1, max_tokens: int = 2048):
         """初始化大语言模型"""
-        logger.info(f"正在初始化LLM: {self.config.llm_model}")
+        logger.info(f"正在初始化LLM: {model_name}")
 
         api_key = os.getenv("MOONSHOT_API_KEY")
         if not api_key:
             raise ValueError("请设置 MOONSHOT_API_KEY 环境变量")
 
         self.llm = init_chat_model(
-            model=self.config.llm_model or os.getenv("MOONSHOT_MODEL_ID"),
+            model="kimi-k2-0905-preview",
             model_provider='openai',
-            api_key=os.getenv("MOONSHOT_API_KEY"),
-            base_url=os.getenv("MOONSHOT_BASE_URL"),
-            temperature=self.config.temperature,
+            api_key='sk-0LKqKgyZwPsTYRY3UB3oecfMFpRagrA3oCCxa0gGF9JqGIAe',
+            base_url='https://api.moonshot.cn/v1',
         )
 
     
-    async def build_knowledge_base(self):
+    def build_knowledge_base(self):
         """构建知识库"""
         print("\n正在构建知识库...")
-        if self.index_module is None or self.data_module is None:
-            raise ValueError("请先初始化系统")
 
         # 1. 尝试加载已保存的索引
-        if await self.index_module.load_index():
+        vectorstore = self.index_module.load_index()
+
+        if vectorstore is not None:
             print("✅ 成功加载已保存的向量索引！")
-            # 仍需要加载文档以获取统计信息和后续使用
-            print("加载食谱文档并进行分块...")
+            # 仍需要加载文档和分块用于检索模块
+            print("加载食谱文档...")
             self.data_module.load_documents()
-            self.data_module.chunk_documents()
+            print("进行文本分块...")
+            chunks = self.data_module.chunk_documents()
         else:
             print("未找到已保存的索引，开始构建新索引...")
 
@@ -139,19 +137,11 @@ class RecipeRAGSystem:
 
             # 4. 构建并保存向量索引
             print("构建并保存向量索引...")
-            await self.index_module.build_vector_index(chunks)
+            vectorstore = self.index_module.build_vector_index(chunks, is_persist=True)
 
         # 6. 初始化检索优化模块
         print("初始化检索优化...")
-        if self.index_module.qdrant_client is not None:
-            self.retrieval_module = RetrievalOptimizationModule(
-                self.data_module, 
-                self.index_module.qdrant_client, 
-                self.config.collection_name, 
-                self.llm, 
-                self.config.hyde_llm_config,
-                self.config.reranker_config
-            )
+        self.retrieval_module = RetrievalOptimizationModule(vectorstore, chunks, self.llm)
 
         # 7. 显示统计信息
         stats = self.data_module.get_statistics()
@@ -162,10 +152,8 @@ class RecipeRAGSystem:
         print(f"   难度分布: {stats['difficulties']}")
 
         print("✅ 知识库构建完成！")
-
-
     
-    async def ask_question(self, question: str, stream: bool = False):
+    def ask_question(self, question: str, stream: bool = False):
         """
         回答用户问题
 
@@ -181,9 +169,6 @@ class RecipeRAGSystem:
         
         print(f"\n❓ 用户问题: {question}")
 
-        if self.generation_module is None or self.retrieval_module is None or self.data_module is None:
-            raise ValueError("模块未初始化")
-
         # 1. 查询路由
         route_type = self.generation_module.query_router(question)
         print(f"🎯 查询类型: {route_type}")
@@ -198,50 +183,79 @@ class RecipeRAGSystem:
             print("🤖 智能分析查询...")
             rewritten_query = self.generation_module.query_rewrite(question)
         
-        # 3. 文档向量检索，并重排结果
+        # 3. 检索相关子块（自动应用元数据过滤）
         print("🔍 检索相关文档...")
+        relevant_chunks = self.retrieval_module.all_retrieval(rewritten_query)  # 全检索，自动结合元数据过滤和混合检索
+        
+        # 对检索结果进行重排
         if route_type == 'list':
-            relevant_docs = await self.retrieval_module.hyde_search(rewritten_query, top_k=self.config.top_k)  # 三个假设性文档嵌入 + 混合搜索 + reranker重排
+            relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k, threshold=0)  # 列表查询不能使用reranker阈值过滤结果，因为分数都不会太高
+        elif route_type == 'general':
+            relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k, threshold=0.2)  # 一般查询使用较宽松的阈值，允许更多相关信息进入生成阶段，提升回答的丰富度和实用性
         else:
-            relevant_docss = await self.retrieval_module.hybrid_search(rewritten_query)  # 全检索，自动结合元数据过滤和混合检索，重排使用的RRF算法，也可以选择reranker
-            relevant_docs = [doc for sublist in relevant_docss for doc in sublist]  # 展平列表
+            relevant_chunks = self.retrieval_module.rerank(rewritten_query, relevant_chunks, top_k=self.config.top_k, threshold=0.5)  # 详细查询使用较高阈值，确保信息高度相关
 
+        # if filters:
+        #     print(f"应用过滤条件: {filters}")
+        #     relevant_chunks = self.retrieval_module.metadata_filtered_search(rewritten_query, filters, top_k=self.config.top_k)
+        # else:
+        #     relevant_chunks = self.retrieval_module.hybrid_search(rewritten_query, top_k=self.config.top_k)
 
         # 显示检索到的子块信息
-        if relevant_docs:
-            doc_info = []
-            for doc in relevant_docs:
-                dish_name = doc.metadata.get('dish_name', '未知菜品')
+        if relevant_chunks:
+            chunk_info = []
+            for chunk in relevant_chunks:
+                dish_name = chunk.metadata.get('dish_name', '未知菜品')
                 title = []
                 for t in ['主标题', '二级标题', '三级标题']:
-                    if doc.metadata.get(t):
-                        title.append(doc.metadata.get(t))
-                doc_info.append(f"{dish_name}({'-'.join(title)})")
+                    if chunk.metadata.get(t):
+                        title.append(chunk.metadata.get(t))
+                chunk_info.append(f"{dish_name}({'-'.join(title)})")
 
-            print(f"找到 {len(relevant_docs)} 个相关文档块: {', '.join(doc_info)}")
+            print(f"找到 {len(relevant_chunks)} 个相关文档块: {', '.join(chunk_info)}")
+        else:
+            print(f"找到 {len(relevant_chunks)} 个相关文档块")
 
-
-        # 4. 检查是否找到相关内容并显示找到的文档名称
-        if not relevant_docs:
+        # 4. 检查是否找到相关内容
+        # 由reranker模型过滤相关文档，若没有相关文档则直接返回提示信息
+        if not relevant_chunks:
             return "抱歉，没有找到相关的食谱信息。请尝试其他菜品名称或关键词。"
-        
-        doc_names = []
-        for doc in relevant_docs:
-            dish_name = doc.metadata.get('dish_name', '未知菜品')
-            doc_names.append(dish_name)
-        if doc_names:
-            print(f"找到文档: {', '.join(doc_names)}")
 
         # 5. 根据路由类型选择回答方式
         if route_type == 'list':
             # 列表查询：直接返回菜品名称列表
             print("📋 生成菜品列表...")
+            relevant_docs = self.data_module.get_parent_documents(relevant_chunks)
+
+            # 显示找到的文档名称
+            doc_names = []
+            for doc in relevant_docs:
+                dish_name = doc.metadata.get('dish_name', '未知菜品')
+                doc_names.append(dish_name)
+
+            if doc_names:
+                print(f"找到文档: {', '.join(doc_names)}")
 
             return self.generation_module.generate_list_answer(question, relevant_docs)
         else:
             # 详细查询：获取完整文档并生成详细回答
+            print("获取完整文档...")
+            relevant_docs = self.data_module.get_parent_documents(relevant_chunks)
+
+            # 显示找到的文档名称
+            doc_names = []
+            for doc in relevant_docs:
+                dish_name = doc.metadata.get('dish_name', '未知菜品')
+                doc_names.append(dish_name)
+
+            if doc_names:
+                print(f"找到文档: {', '.join(doc_names)}")
+            else:
+                print(f"对应 {len(relevant_docs)} 个完整文档")
+
             print("✍️ 生成详细回答...")
 
+            # 根据路由类型自动选择回答模式
             if route_type == "detail":
                 # 详细查询使用分步指导模式
                 if stream:
@@ -295,7 +309,7 @@ class RecipeRAGSystem:
         search_query = query if query else category
         filters = {"category": category}
         
-        docs = self.retrieval_module.metadata_filtered_search(search_query, filters, top_k=10) or []
+        docs = self.retrieval_module.metadata_filtered_search(search_query, filters, top_k=10)
         
         # 提取菜品名称
         dish_names = []
@@ -306,28 +320,28 @@ class RecipeRAGSystem:
         
         return dish_names
     
-    # def get_ingredients_list(self, dish_name: str) -> str:
-    #     """
-    #     获取指定菜品的食材信息
+    def get_ingredients_list(self, dish_name: str) -> str:
+        """
+        获取指定菜品的食材信息
 
-    #     Args:
-    #         dish_name: 菜品名称
+        Args:
+            dish_name: 菜品名称
 
-    #     Returns:
-    #         食材信息
-    #     """
-    #     if not all([self.retrieval_module, self.generation_module]):
-    #         raise ValueError("请先构建知识库")
+        Returns:
+            食材信息
+        """
+        if not all([self.retrieval_module, self.generation_module]):
+            raise ValueError("请先构建知识库")
 
-    #     # 搜索相关文档
-    #     docs = self.retrieval_module.hybrid_search(dish_name, top_k=3)
+        # 搜索相关文档
+        docs = self.retrieval_module.hybrid_search(dish_name, top_k=3)
 
-    #     # 生成食材信息
-    #     answer = self.generation_module.generate_basic_answer(f"{dish_name}需要什么食材？", docs)
+        # 生成食材信息
+        answer = self.generation_module.generate_basic_answer(f"{dish_name}需要什么食材？", docs)
 
-    #     return answer
+        return answer
     
-    async def run_interactive(self):
+    def run_interactive(self):
         """运行交互式问答"""
         print("=" * 60)
         print("🍽️  尝尝咸淡RAG系统 - 交互式问答  🍽️")
@@ -338,7 +352,7 @@ class RecipeRAGSystem:
         self.initialize_system()
         
         # 构建知识库
-        await self.build_knowledge_base()
+        self.build_knowledge_base()
         
         print("\n交互式问答 (输入'退出'结束):")
         
@@ -356,12 +370,12 @@ class RecipeRAGSystem:
                 print("\n回答:")
                 if use_stream:
                     # 流式输出
-                    # for doc in self.ask_question(user_input, stream=True):
-                    #     print(doc, end="", flush=True)
+                    for chunk in self.ask_question(user_input, stream=True):
+                        print(chunk, end="", flush=True)
                     print("\n")
                 else:
                     # 普通输出
-                    answer = await self.ask_question(user_input, stream=False)
+                    answer = self.ask_question(user_input, stream=False)
                     print(f"{answer}\n")
                 
             except KeyboardInterrupt:
@@ -373,18 +387,18 @@ class RecipeRAGSystem:
 
 
 
-async def main():
+def main():
     """主函数"""
     try:
         # 创建RAG系统
         rag_system = RecipeRAGSystem()
         
         # 运行交互式问答
-        await rag_system.run_interactive()
+        rag_system.run_interactive()
         
     except Exception as e:
         logger.error(f"系统运行出错: {e}")
         print(f"系统错误: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
