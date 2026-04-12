@@ -72,3 +72,6 @@ rag/
 # LLM API keys
 *.key
 *.secret
+
+# Qdrant
+qdrant_data/

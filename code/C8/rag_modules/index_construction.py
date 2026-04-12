@@ -52,7 +52,8 @@ class IndexConstructionModule:
         dense_model = HuggingFaceEmbeddings(
             model_name=dense_model_name,
             model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
+            encode_kwargs={'normalize_embeddings': True}, 
+            cache_folder='/tmp/model_cache'
         )
         sparse_model = JiebaFastEmbed(model_name='Qdrant/bm25')  # 重新封装的适合中文的稀疏向量模型
         self.qdrant_client.set_dense_model(dense_model)

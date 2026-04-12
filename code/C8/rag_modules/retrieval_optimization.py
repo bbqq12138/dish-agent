@@ -116,7 +116,7 @@ class RetrievalOptimizationModule:
                     using="dense",
                     query=query_dense_vec,
                     limit=2 * top_k, 
-                    with_payload=['parent_id']
+                    with_payload=['parent_id', 'chunk_id']
                 )
             )
             requests.append(
@@ -135,70 +135,71 @@ class RetrievalOptimizationModule:
             collection_name=self.collection_name, 
             requests=requests, 
         )
+        
 
-        # 3. 从两路检索结果中提取出父文档ID，并获取对应的父文档内容，并进行RRF重排
+        # 3. 从两路检索结果中提取出父文档ID，并获取对应的分块文档内容，并进行RRF重排
         rrf_reranked_docs = []
         for i in range(num_query):
             vector_ids = list(point.payload['chunk_id'] for point in results[i*2].points if point.payload.get('chunk_id'))  # type: ignore # 未去重
             bm25_ids = list(point.payload['chunk_id'] for point in results[i*2+1].points if point.payload.get('chunk_id')) # type: ignore
         
-            vector_docs = self.data_module.get_chunks(vector_ids) # 去重？
-            bm25_docs = self.data_module.get_chunks(bm25_ids)
 
-            rrf_reranked_docs.append(self._rrf_rerank(vector_docs, bm25_docs, top_k=top_k, vector_weight=vector_weight))  # 每个查询都进行RRF重排，并选取top_k个结果
+            vector_chunks = self.data_module.get_chunks(vector_ids)
+            bm25_chunks = self.data_module.get_chunks(bm25_ids)
+
+            logger.debug(f"查询 {i+1}: 向量检索得到 {len(vector_chunks)} 个文档块，BM25检索得到 {len(bm25_chunks)} 个文档块")
+            # for chunk in vector_chunks:
+            #     print(chunk.metadata['dish_name'])
+            # print('=' * 10)
+            # for chunk in bm25_chunks:
+            #     print(chunk.metadata['dish_name'])
+
+            rrf_reranked_docs.append(self._rrf_rerank(vector_chunks, bm25_chunks, top_k=top_k, vector_weight=vector_weight))  # 每个查询都进行RRF重排，并选取top_k个结果
     
 
-        return rrf_reranked_docs # 返回的是chunks的列表
+        return rrf_reranked_docs # 这里只是返回chunks，而不是父文档
         
     
 
-    async def rerank_model_rerank(self, query: str, candidate_docs: List[Document], top_k: int=5, threshold: float=0.6) -> List[Document]:
+    async def rerank_model_rerank(self, query: str, candidate_docs: List[Document], threshold: float = 0) -> List[Document]: 
         """
         对候选文档进行重排，这里使用 cross-encoder reranker 对候选文档进行打分，并根据分数进行排序，选择 top_k 个文档返回
+
+        Args:
+            query: 查询文本
+            candidate_docs: 候选文档列表
+            threshold: 相关性阈值，只有得分高于该阈值的文档才会被返回，默认为0，即不进行过滤
         """
         text_pairs = []
         for doc in candidate_docs:
-            text_pairs.append((query, doc.page_content))
+            text_pairs.append((query, doc.page_content))  # 将菜谱名称和内容拼接起来作为文档的文本输入，供reranker模型打分使用
         
         if not self.qdrant_client.reranker:
             logger.error("Reranker模型未设置，无法进行重排")
             raise ValueError("Reranker模型未设置，无法进行重排")
         
         scores = await asyncio.to_thread(self.qdrant_client.reranker.compute_score, text_pairs)
+
         if scores is None:
             logger.error("重排过程中出现错误，无法获取文档得分")
             raise ValueError("重排过程中出现错误，无法获取文档得分")
-        scores = [(score, i) for i, score in enumerate(scores)]
-        scores.sort(reverse=True, key=(lambda x: x[0]))
-        logger.info(scores)
+        scores_seq = [(score, i) for i, score in enumerate(scores)]
+        scores_seq.sort(reverse=True, key=(lambda x: x[0]))
+        logger.debug(scores_seq)
 
         reranked_docs = []
-        count = 0
-        for score, seq in scores:
-            if score < threshold:     # 这里设置一个排序模型的分数阈值，只有当文档与查询的相关性得分超过threshold时才被认为是相关的，才会被加入到重排结果中
-                continue
+        for score, seq in scores_seq:
+            candidate_docs[seq].metadata['rerank_score'] = score  # 将重排得分添加到文档的元数据中，方便后续分析和调试
             reranked_docs.append(candidate_docs[seq])
-            count += 1
-            if count >= top_k:
-                break
 
-        logger.info(f"重排完成: 输入候选文档{len(candidate_docs)}个, 输出重排后文档{len(reranked_docs)}个")
+        if threshold > 0:
+            reranked_docs = [doc for doc in reranked_docs if doc.metadata.get('rerank_score') >= threshold]
+            logger.info(f"应用重排得分阈值 {threshold}，过滤掉得分低于阈值的 {len(candidate_docs) - len(reranked_docs)} 个文档，剩余 {len(reranked_docs)} 个文档")
+
+        logger.debug(f"重排完成，原候选文档数: {len(candidate_docs)}, 重排后文档数: {len(reranked_docs)}")
+        
         return reranked_docs
     
-
-    # def all_retrieval(self, query: str, weight=[0.4, 0.6]) -> List[Document]:
-    #     """
-    #     全检索 - 先进行元数据过滤，再在其上层进行BM25和稠密向量检索，最后混合排序
-    #     这里为了简单，分 元数据过滤+稠密向量检索 和 混合检索 两路，最终重排序（当然这并不完全合理）
-    #     """
-    #     metadata_filtered_docs = self.metadata_filtered_search_(query)
-    #     hybrid_docs = self.hybrid_search(query, top_k=5, weight=weight)  # 先获取更多的候选文档，后续再重排过滤
-
-    #     revelant_docs = self._unique_documents(metadata_filtered_docs, hybrid_docs)    # 合并两个检索器的结果
-        
-    #     logger.info(f"基于元数据的自检索器，找到 {len(metadata_filtered_docs)} 个相关文档块, 基于混合检索器，找到 {len(hybrid_docs)} 个相关文档块, 合并后共有 {len(revelant_docs)} 个相关文档块")
-        
-    #     return revelant_docs
 
     def _rrf_rerank(self, vector_docs: List[Document], bm25_docs: List[Document], top_k: int = 5, k: int = 60, vector_weight: float = 0.6) -> List[Document]:
         """
@@ -272,14 +273,16 @@ class RetrievalOptimizationModule:
 
         return unique_docs + docs1
 
-    async def hyde_search(self, query: str, top_k: int = 5) -> List[Document]:
+    async def hyde_search(self, query: str, top_k: int = 5, threshold: float = 0.25, vector_weight: float = 1.0) -> List[Document]:
         """
         HYDE检索 - 先让大模型根据查询生成一个假想的文档，然后用这个文档去进行向量检索，最后重排
+        PS：由于实际测试稀疏向量检索效果很差，所以不召回稀疏向量检索结果
 
         Args:
             query: 查询文本
             top_k: 返回结果数量
-
+            threshold: 相关性阈值
+            vector_weight: 向量检索的权重（BM25很多时候相关性不高，可以降低它的权重）
         Returns:
             检索到的文档列表
         """
@@ -288,12 +291,14 @@ class RetrievalOptimizationModule:
         hyde_cot_prompt = f"""
 你是一个顶级的 AI 饮食推荐引擎。你的任务是深度解析用户的饮食需求，进行意图推理后，生成**三个**相关的、极具画面感的菜品描述（假设性菜谱文档），用于后续的向量数据库检索。
 
+
 【生成要求】
-1. 必须输出且仅输出一个合法的 JSON 对象，不要包含任何多余的解释文字或 Markdown 标记符号（如 ```json）。
+1. 必须输出且仅输出一个合法的 JSON 对象。
 2. JSON 对象必须包含以下两个字段：
    - "analyze": (字符串) 你的思考过程。简要分析用户的真实意图、情绪场景、所需的营养搭配，以及推导应该采用哪三种不同的烹饪手法/食材组合来满足用户。
    - "hyde_documents": (JSON数组, 数组内是3个字符串) 包含 3 个不同的菜谱描述。每个描述 50-100 字。
 3. ⚠️ 对于 hyde_documents 的极其重要要求：描述中要大量使用【烹饪动词】（如：大火爆香、慢炖、收汁）、【感官形容词】（如：外酥里嫩、汤汁浓郁、清脆解腻）和【具体食材类别】。模仿真实菜谱的正文口吻，绝对不要写干瘪的标签。
+
 
 【Few-Shot 示例】
 
@@ -319,11 +324,14 @@ class RetrievalOptimizationModule:
     ]
 }}
 
-输入：{query}
+
+用户输入：{query}
 输出："""
 
-        hyde_result = await self.hyde_llm.ainvoke([SystemMessage(content=hyde_cot_prompt)])
-        
+        hyde_result = await self.hyde_llm.ainvoke(
+            [SystemMessage(content=hyde_cot_prompt)], 
+            response_format= {"type": "json_object"}    # API结构化输出指令
+        )
         # 2. 生成的结果为JSON对象，解析出hyde_recipes字段，作为后续检索的查询条件
         try:
             hyde_recipes = json.loads(s=hyde_result.content) # type: ignore
@@ -331,28 +339,41 @@ class RetrievalOptimizationModule:
             logger.error(f"HyDE生成的文档不是合法的JSON格式: {e}")
             raise ValueError("HyDE生成的文档不是合法的JSON格式")
 
-        analyze = hyde_recipes.get('analyze', '')
+        analyze = hyde_recipes.get('analyze', [])
         hyde_docs = hyde_recipes.get('hyde_documents', [])
-        logger.info(f"HyDE分析结果: {analyze}\nHyDE生成了 {len(hyde_docs)} 个假想文档")
+        logger.info(f"\nHyDE分析结果: {analyze}\nHyDE生成了 {len(hyde_docs)} 个假想文档")
+
         logger.debug(f"HyDE生成的假想文档: {hyde_docs}")
 
+
         # 3. 用生成的hyde_docs去进行向量检索，获取相关文档
-        reranked_docs = []
+        res_chunks = []
         if hyde_docs:
-            res_docss = await self.hybrid_search(hyde_docs, top_k=2 * top_k  // len(hyde_docs))   # 这里直接用混合检索，利用生成的hyde_docs去进行向量检索，获取相关文档
-            for i, docs in enumerate(res_docss):
-                logger.info(f"使用假想文档 {i+1} 进行检索，得到 {len(docs)} 个相关文档")
-                reranked_docs.append(await self.rerank_model_rerank(hyde_docs[i], docs, top_k=top_k, threshold=0.3))
-            # res_docs = [doc for docs in res_docss for doc in docs]  # 展平列表
-            # logger.info(f"检索到 {len(res_docs)} 个相关文档"  )
+            res_chunkses = await self.hybrid_search(hyde_docs, top_k=2 * top_k // len(hyde_docs), vector_weight=vector_weight)   # 这里直接用混合检索，利用生成的hyde_docs去进行向量检索，获取相关文档
+            
+            for i, chunks in enumerate(res_chunkses):
+                logger.debug(f"使用假想文档 {i+1} 进行检索，得到 {len(chunks)} 个相关文档块")
+                # for chunk in chunks:
+                #     logger.info(f"假想文档 {i+1} 的检索结果文档块菜名: {chunk.metadata.get('dish_name')}")
+                sort_chunks = await self.rerank_model_rerank(hyde_docs[i], chunks)  # 对每个假想文档检索到的文档进行重排，使用假想文档作为query，得到更相关的文档块
+                res_chunks.extend(sort_chunks)
         else:
-            res_docss = await self.hybrid_search(query, top_k=top_k, vector_weight=0.7)   # 如果HyDE没有生成有效的文档，就退化到普通的混合检索
-            res_docs = res_docss[0]
+            res_chunkss = await self.hybrid_search(query, top_k=top_k, vector_weight=vector_weight)   # 如果HyDE没有生成有效的文档，就退化到普通的混合检索
+            res_chunks = await self.rerank_model_rerank(query, res_chunkss[0]) if res_chunkss else []
+
+
+        # 4. 对取得的所有文档块进行重排，选取相关度最高的top_k个返回，小于阈值的过滤掉，避免返回无关文档
+        res_chunks.sort(key=lambda x: x.metadata['rerank_score'], reverse=True)
+    
+        cot = 0
+        while cot < top_k and res_chunks[cot].metadata['rerank_score'] >= threshold:  # 这里设置一个阈值，过滤掉相关度过低的文档块，避免返回无关文档
+            cot += 1
         
-        # 4. 重排并返回结果
-        
-        logger.debug(f"🔍HyDE检索完成:  检索并重排后返回{len(reranked_docs)}个文档")
-        return reranked_docs
+        if cot > 0:
+            logger.debug(f"🔍HyDE检索完成:  检索并重排后返回{cot}个文档块")
+        else: logger.debug(f"🔍HyDE检索完成: 没有文档块的相关度超过设定的阈值 {threshold}，未返回任何文档块")
+
+        return res_chunks[: cot]
 
     def metadata_filtered_search(self, query: str, filters: Dict[str, Any], top_k: int = 5):
         pass

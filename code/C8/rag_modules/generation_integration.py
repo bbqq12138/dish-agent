@@ -2,13 +2,12 @@
 生成集成模块
 """
 
-import os
+import json
 import logging
 from typing import List
 
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
 from langchain_core.messages import SystemMessage
-from langchain_community.chat_models.moonshot import MoonshotChat
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
@@ -27,7 +26,7 @@ class GenerationIntegrationModule:
         """
         self.llm = llm
     
-    def generate_basic_answer(self, query: str, context_docs: List[Document]) -> str:
+    async def generate_basic_answer(self, query: str, context_docs: List[Document]) -> str:
         """
         生成基础回答
 
@@ -63,7 +62,7 @@ class GenerationIntegrationModule:
         response = chain.invoke(query)
         return response
     
-    def generate_step_by_step_answer(self, query: str, context_docs: List[Document]) -> str:
+    async def generate_step_by_step_answer(self, query: str, context_docs: List[Document]) -> str:
         """
         生成分步骤回答
 
@@ -77,7 +76,7 @@ class GenerationIntegrationModule:
         context = self._build_context(context_docs)
 
         prompt = ChatPromptTemplate.from_template("""
-你是一位专业的烹饪导师。请根据食谱信息，为用户提供详细的分步骤指导。
+你是一位专业的烹饪导师。请根据食谱信息和用户请求，为用户提供详细的分步骤指导。
 
 用户问题: {question}
 
@@ -99,10 +98,9 @@ class GenerationIntegrationModule:
 [仅在有实用技巧时包含。优先使用原文中的实用技巧，如果原文的"附加内容"与烹饪无关或为空，可以基于制作步骤总结关键要点，或者完全省略此部分]
 
 注意：
-- 根据实际内容灵活调整结构
-- 不要强行填充无关内容或重复制作步骤中的信息
-- 重点突出实用性和可操作性
-- 如果没有额外的技巧要分享，可以省略制作技巧部分
+- 如果没有相关食谱信息，请直接回答 "抱歉，没有找到相关食谱信息，无法提供详细指导。请更改描述或尝试其他查询。"
+- 根据实际内容和用户请求灵活调整结构，回答要满足用户需求，但不需要为了满足结构而填充无关内容
+- 如：用户只需要食材那就只输出食材部分，用户需要制作步骤那就全部输出
 
 回答:""")
 
@@ -113,7 +111,7 @@ class GenerationIntegrationModule:
             | StrOutputParser()
         )
 
-        response = chain.invoke(query)
+        response = await chain.ainvoke(query)
         return response
     
     def query_rewrite(self, query: str) -> str:
@@ -235,7 +233,7 @@ class GenerationIntegrationModule:
         else:
             return 'general'  # 默认类型
 
-    def generate_list_answer(self, query: str, context_docs: List[Document]) -> str:
+    async def generate_list_answer(self, query: str, context_docs: List[Document]) -> str:
         """
         生成列表式回答 - 适用于推荐类查询
 
@@ -246,43 +244,78 @@ class GenerationIntegrationModule:
         Returns:
             列表式回答
         """
-        if not context_docs:
-            return "抱歉，没有找到相关的菜品信息。"
 
-        # 提取菜品名称
-        dish_names = []
-        for doc in context_docs:
-            dish_name = doc.metadata.get('dish_name', '未知菜品')
-            if dish_name not in dish_names:
-                dish_names.append(dish_name)
+        # dish_context = "\n\n".join(list(doc.page_content for doc in context_docs))
+        context = self._build_context(context_docs)
 
-        # 构建简洁的列表回答
-        if len(dish_names) == 1:
-            return f"为您推荐：{dish_names[0]}"
-        elif len(dish_names) <= 3:
-            return f"为您推荐以下菜品：\n" + "\n".join([f"{i+1}. {name}" for i, name in enumerate(dish_names)])
-        else:
-            return f"为您推荐以下菜品：\n" + "\n".join([f"{i+1}. {name}" for i, name in enumerate(dish_names[:3])]) + f"\n\n还有其他 {len(dish_names)-3} 道菜品可供选择。"
+        list_answer_prompt = f"""你是一个菜品推荐助手。根据用户的提问和相关的菜品资料，生成一个简洁的推荐列表回答。
+
+格式：
+1. 菜品名称，理由
+2. 菜品名称，理由
+...
+
+
+要求：
+ - 请严格按照上述格式生成回答
+ - 根据用户的要求和资料选择其中最相关的菜品，推荐理由可以简短说明，当不需要理由时可以省略
+ - 当没有与用户要求相关的菜品信息时，请直接返回 "抱歉，没有找到相关的菜品信息，无法提供推荐。请更改描述或尝试其他查询。"
+
+相关菜品信息:
+{context}
+
+用户问题: {query}"""
         
-#         dish_context = "\n\n".join(list(doc.page_content for doc in context_docs))
-#         list_answer_prompt = f"""你是一个菜品推荐助手。根据用户的提问和相关的菜品资料，生成一个简洁的推荐列表回答。
+        result = await self.llm.ainvoke(
+            input=[SystemMessage(content=list_answer_prompt)], 
+            temperature=0.6, 
+        )
 
-# 格式：
-# 1. 菜品名称1。理由（可选）
-# 2. 菜品名称2。理由（可选）
-# 3. 菜品名称3。理由（可选）
-# 还有其他X道菜品可供选择。
+        return result.content.strip()
 
-# 要求：
-#  - 请严格按照上述格式生成回答
-#  - 根据用户的要求和资料选择其中最相关的菜品，如果相关菜品较多，推荐最相关的前3个，并提示还有其他X道菜品可供选择
-#  - 推荐理由可以简短说明，当不需要理由时可以省略
 
-# 用户问题: {query}
-# 相关菜品信息:
-# {context}"""
+    async def generate_list_answer_stream(self, query: str, context_docs: List[Document]):
+        """
+        生成列表式回答 - 适用于推荐类查询
 
-    def generate_basic_answer_stream(self, query: str, context_docs: List[Document]):
+        Args:
+            query: 用户查询
+            context_docs: 上下文文档列表
+
+        Returns:
+            列表式回答
+        """
+
+        context = self._build_context(context_docs)
+        list_answer_prompt = f"""你是一个菜品推荐助手。根据用户的提问和相关的菜品资料，生成一个简洁的推荐列表回答。
+
+格式：
+1. 菜品名称，理由
+2. 菜品名称，理由
+...
+
+
+要求：
+ - 请严格按照上述格式生成回答
+ - 根据用户的要求和资料选择其中最相关的菜品，推荐理由可以简短说明，当不需要理由时可以省略
+ - 当没有与用户要求相关的菜品信息时，请直接返回 "抱歉，没有找到相关的菜品信息，无法提供推荐。请更改描述或尝试其他查询。"
+
+相关菜品信息:
+{context}
+
+用户问题: {query}"""
+        
+
+        stream_iter = self.llm.astream(
+            input=[SystemMessage(content=list_answer_prompt)], 
+            temperature=0.6,
+        )
+
+        async for output_chunk in stream_iter:
+            yield output_chunk.content      # yield 返回生成器而不是直接返回值或返回协程，因此 async 函数使用yield，返回的是异步生成器
+
+
+    async def generate_basic_answer_stream(self, query: str, context_docs: List[Document]):
         """
         生成基础回答 - 流式输出
 
@@ -314,10 +347,10 @@ class GenerationIntegrationModule:
             | StrOutputParser()
         )
 
-        for chunk in chain.stream(query):   # stream方法会返回一个生成器，逐步输出回答内容
-            yield chunk                     # yield替代return，使函数成为一个生成器，允许逐步输出回答片段（return只能返回一次，yield可以多次返回）
+        async for chunk in chain.astream(query):
+            yield chunk
 
-    def generate_step_by_step_answer_stream(self, query: str, context_docs: List[Document]):
+    async def generate_step_by_step_answer_stream(self, query: str, context_docs: List[Document]):
         """
         生成详细步骤回答 - 流式输出
 
@@ -331,7 +364,7 @@ class GenerationIntegrationModule:
         context = self._build_context(context_docs)
 
         prompt = ChatPromptTemplate.from_template("""
-你是一位专业的烹饪导师。请根据食谱信息，为用户提供详细的分步骤指导。
+你是一位专业的烹饪导师。请根据食谱信息和用户请求，为用户提供详细的分步骤指导。
 
 用户问题: {question}
 
@@ -353,9 +386,9 @@ class GenerationIntegrationModule:
 [仅在有实用技巧时包含。如果原文的"附加内容"与烹饪无关或为空，可以基于制作步骤总结关键要点，或者完全省略此部分]
 
 注意：
-- 根据实际内容灵活调整结构
-- 不要强行填充无关内容
-- 重点突出实用性和可操作性
+- 如果没有相关食谱信息，请直接回答 "抱歉，没有找到相关食谱信息，无法提供详细指导。请更改描述或尝试其他查询。"
+- 根据实际内容和用户请求灵活调整结构，回答要满足用户需求，但不需要为了满足结构而填充无关内容
+- 如：用户只需要食材那就只输出食材部分，用户需要制作步骤那就全部输出
 
 回答:""")
 
@@ -366,7 +399,7 @@ class GenerationIntegrationModule:
             | StrOutputParser()
         )
 
-        for chunk in chain.stream(query):
+        async for chunk in chain.astream(query):
             yield chunk
 
     def _build_context(self, docs: List[Document], max_length: int = 5000) -> str:

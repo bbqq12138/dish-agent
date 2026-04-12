@@ -7,10 +7,10 @@ import sys
 import asyncio
 import logging
 from pathlib import Path
-from typing import List
+from collections.abc import AsyncIterator
+from typing import List, Literal, overload
 from huggingface_hub import login
 from langchain.chat_models import init_chat_model
-
 
 # 添加模块路径
 sys.path.append(str(Path(__file__).parent))
@@ -40,9 +40,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("langchain").setLevel(logging.WARNING)
 logging.getLogger("jieba").setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 
 # 登录Hugging Face Hub（如果需要）
-login(token=os.getenv("HF_TOKEN"))
+if "HF_TOKEN" not in os.environ:
+    login(token=os.getenv("HF_TOKEN"))
 
 class RecipeRAGSystem:
     """食谱RAG系统主类"""
@@ -165,7 +168,15 @@ class RecipeRAGSystem:
 
 
     
-    async def ask_question(self, question: str, stream: bool = False):
+    @overload
+    async def ask_question(self, question: str, stream: Literal[False] = False) -> str:  # type: ignore[overload-overlap]
+        ...
+
+    @overload
+    async def ask_question(self, question: str, stream: Literal[True]) -> AsyncIterator[str]:
+        ...
+
+    async def ask_question(self, question: str, stream: bool = False) -> str | AsyncIterator[str]:
         """
         回答用户问题
 
@@ -184,6 +195,10 @@ class RecipeRAGSystem:
         if self.generation_module is None or self.retrieval_module is None or self.data_module is None:
             raise ValueError("模块未初始化")
 
+        generation_module = self.generation_module
+        retrieval_module = self.retrieval_module
+        data_module = self.data_module
+
         # 1. 查询路由
         route_type = self.generation_module.query_router(question)
         print(f"🎯 查询类型: {route_type}")
@@ -201,16 +216,17 @@ class RecipeRAGSystem:
         # 3. 文档向量检索，并重排结果
         print("🔍 检索相关文档...")
         if route_type == 'list':
-            relevant_docs = await self.retrieval_module.hyde_search(rewritten_query, top_k=self.config.top_k)  # 三个假设性文档嵌入 + 混合搜索 + reranker重排
+            relevant_chunks = await retrieval_module.hyde_search(rewritten_query, top_k=self.config.top_k)  # 三个假设性文档嵌入 + 混合搜索 + reranker重排
         else:
-            relevant_docss = await self.retrieval_module.hybrid_search(rewritten_query)  # 全检索，自动结合元数据过滤和混合检索，重排使用的RRF算法，也可以选择reranker
-            relevant_docs = [doc for sublist in relevant_docss for doc in sublist]  # 展平列表
+            relevant_chunkses = await retrieval_module.hybrid_search(rewritten_query, top_k=self.config.top_k)  # 全检索，自动结合元数据过滤和混合检索，重排使用的RRF算法，也可以选择reranker
+            unrerank_relevant_chunks = [doc for sublist in relevant_chunkses for doc in sublist]  # 展平列表
+            relevant_chunks = await retrieval_module.rerank_model_rerank(rewritten_query, unrerank_relevant_chunks, threshold=0.5)  # 对chunks进行reranker重排，过滤不相关文档块
 
 
         # 显示检索到的子块信息
-        if relevant_docs:
+        if relevant_chunks:
             doc_info = []
-            for doc in relevant_docs:
+            for doc in relevant_chunks:
                 dish_name = doc.metadata.get('dish_name', '未知菜品')
                 title = []
                 for t in ['主标题', '二级标题', '三级标题']:
@@ -218,42 +234,62 @@ class RecipeRAGSystem:
                         title.append(doc.metadata.get(t))
                 doc_info.append(f"{dish_name}({'-'.join(title)})")
 
-            print(f"找到 {len(relevant_docs)} 个相关文档块: {', '.join(doc_info)}")
+            print(f"\n找到 {len(relevant_chunks)} 个相关文档块: {', '.join(doc_info)}")
 
 
-        # 4. 检查是否找到相关内容并显示找到的文档名称
+        # 4. 检索父文档并去重
+        doc_ids = []
+        for chunk in relevant_chunks:
+            parent_id = chunk.metadata.get('parent_id')
+            if parent_id is not None and isinstance(parent_id, str):
+                doc_ids.append(parent_id)
+        relevant_docs = data_module.get_documents(doc_ids)
+
+
+        # 5. 检查是否找到相关内容并显示找到的文档名称
         if not relevant_docs:
-            return "抱歉，没有找到相关的食谱信息。请尝试其他菜品名称或关键词。"
-        
-        doc_names = []
-        for doc in relevant_docs:
-            dish_name = doc.metadata.get('dish_name', '未知菜品')
-            doc_names.append(dish_name)
-        if doc_names:
-            print(f"找到文档: {', '.join(doc_names)}")
+            print("抱歉，没有找到相关的食谱信息。请尝试其他菜品名称或关键词。")
+        else:
+            doc_names = []
+            for doc in relevant_docs:
+                dish_name = doc.metadata.get('dish_name', '未知菜品')
+                doc_names.append(dish_name)
+            if doc_names:
+                print(f"找到文档: {', '.join(doc_names)}\n")
 
         # 5. 根据路由类型选择回答方式
+        if stream:
+            # 统一返回异步生成器，避免调用侧区分同步/异步生成器
+            async def _stream_answer():
+                if route_type == 'list':
+                    print("📋 生成菜品列表...")
+                    async for chunk in generation_module.generate_list_answer_stream(question, relevant_docs):
+                        yield chunk
+                    return
+
+                print("✍️ 生成详细回答...")
+                if route_type == "detail":
+                    async for chunk in generation_module.generate_step_by_step_answer_stream(question, relevant_docs):
+                        yield chunk
+                else:
+                    async for chunk in generation_module.generate_basic_answer_stream(question, relevant_docs):
+                        yield chunk
+
+            return _stream_answer() 
+
         if route_type == 'list':
             # 列表查询：直接返回菜品名称列表
             print("📋 生成菜品列表...")
+            return await generation_module.generate_list_answer(question, relevant_docs)
 
-            return self.generation_module.generate_list_answer(question, relevant_docs)
-        else:
-            # 详细查询：获取完整文档并生成详细回答
-            print("✍️ 生成详细回答...")
+        # 详细查询：获取完整文档并生成详细回答
+        print("✍️ 生成详细回答...")
 
-            if route_type == "detail":
-                # 详细查询使用分步指导模式
-                if stream:
-                    return self.generation_module.generate_step_by_step_answer_stream(question, relevant_docs)
-                else:
-                    return self.generation_module.generate_step_by_step_answer(question, relevant_docs)
-            else:
-                # 一般查询使用基础回答模式
-                if stream:
-                    return self.generation_module.generate_basic_answer_stream(question, relevant_docs)
-                else:
-                    return self.generation_module.generate_basic_answer(question, relevant_docs)
+        if route_type == "detail":
+            return await generation_module.generate_step_by_step_answer(question, relevant_docs)
+
+        # 一般查询使用基础回答模式
+        return await generation_module.generate_basic_answer(question, relevant_docs)
     
 
     def _extract_filters_from_query(self, query: str) -> dict:
@@ -356,8 +392,9 @@ class RecipeRAGSystem:
                 print("\n回答:")
                 if use_stream:
                     # 流式输出
-                    # for doc in self.ask_question(user_input, stream=True):
-                    #     print(doc, end="", flush=True)
+                    stream_iter = await self.ask_question(user_input, stream=True)
+                    async for output_chunk in stream_iter:
+                        print(output_chunk, end="", flush=True)
                     print("\n")
                 else:
                     # 普通输出

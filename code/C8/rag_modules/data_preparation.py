@@ -41,7 +41,8 @@ class DataPreparationModule:
         self.data_path = data_path
         self.documents: List[Document] = []  # 父文档（完整食谱）
         self.chunks: List[Document] = []     # 子文档（按标题分割的小块）
-        self.parent_child_map: Dict[str, str] = {}  # 子块ID -> 父文档ID的映射
+        self.document_id_map: Dict[str, int] = {}  # 文档ID -> batch_index的映射（用于后续批次处理）
+        self.chunk_id_map: Dict[str, int] = {}  # chunk_id -> batch_index的映射（用于后续批次处理）
     
     def load_documents(self) -> List[Document]:
         """
@@ -80,6 +81,7 @@ class DataPreparationModule:
                     }
                 )
                 documents.append(doc)
+                self.document_id_map[parent_id] = len(documents) - 1  # 更新文档ID到batch_index的映射
 
             except Exception as e:
                 logger.warning(f"读取文件 {md_file} 失败: {e}")
@@ -154,10 +156,12 @@ class DataPreparationModule:
 
         # 为每个chunk添加基础元数据
         for i, chunk in enumerate(chunks):
-            chunk_flag = chunk.page_content[:50]  # 取内容前50字符作为标识
-            chunk.metadata['chunk_id'] = hashlib.md5(chunk_flag.encode("utf-8")).hexdigest()  # 基于内容生成稳定的chunk_id，避免每次运行都变化
+            if 'chunk_id' not in chunk.metadata:
+                # 如果没有chunk_id（比如分割失败的情况），则生成一个
+                chunk.metadata['chunk_id'] = str(uuid.uuid4())
             chunk.metadata['batch_index'] = i  # 在当前批次中的索引
             chunk.metadata['chunk_size'] = len(chunk.page_content)
+            self.chunk_id_map[chunk.metadata['chunk_id']] = i  # 更新chunk_id到batch_index的映射
 
         self.chunks = chunks
         logger.info(f"Markdown分块完成，共生成 {len(chunks)} 个chunk")
@@ -174,7 +178,7 @@ class DataPreparationModule:
         headers_to_split_on = [
             ("#", "主标题"),      # 菜品名称
             ("##", "二级标题"),   # 必备原料、计算、操作等
-            ("###", "三级标题")   # 简易版本、复杂版本等
+            # ("###", "三级标题")   # 三级标题将文档分割得过细，导致检索有问题
         ]
 
         # 创建Markdown分割器
@@ -208,8 +212,12 @@ class DataPreparationModule:
                 parent_id = doc.metadata["parent_id"]
 
                 for i, chunk in enumerate(md_chunks):
+                    # 将菜品名称和分类添加到chunk内容开头，增强上下文信息，有利于向量检索
+                    chunk.page_content = doc.metadata.get('dish_name', '') + ' ' + doc.metadata.get('category', '') + '\n' + chunk.page_content
+
                     # 为子块分配唯一ID
-                    child_id = str(uuid.uuid4())
+                    chunk_flag = chunk.page_content[:50]  # 取内容前50字符作为标识
+                    child_id = hashlib.md5(chunk_flag.encode("utf-8")).hexdigest()  # 基于内容生成稳定的chunk_id，避免每次运行都变化
 
                     # 合并原文档元数据和新的标题元数据
                     chunk.metadata.update(doc.metadata)
@@ -219,9 +227,6 @@ class DataPreparationModule:
                         "doc_type": "child",  # 标记为子文档
                         "chunk_index": i      # 在父文档中的位置
                     })
-
-                    # 建立父子映射关系
-                    self.parent_child_map[child_id] = parent_id
 
                 all_chunks.extend(md_chunks)
 
@@ -321,8 +326,8 @@ class DataPreparationModule:
         Returns:
             对应的子块文档列表
         """
-        chunk_map = {chunk.metadata.get('chunk_id'): chunk for chunk in self.chunks}
-        return [chunk_map[chunk_id] for chunk_id in chunk_ids if chunk_id in chunk_map]
+        result_chunks = [self.chunks[self.chunk_id_map[chunk_id]] for chunk_id in chunk_ids if chunk_id in self.chunk_id_map]
+        return result_chunks
 
     def get_documents(self, parent_ids: List[str]) -> List[Document]:
         """
@@ -346,10 +351,8 @@ class DataPreparationModule:
 
                 # 缓存父文档（避免重复查找）
                 if parent_id not in parent_docs_map:
-                    for doc in self.documents:
-                        if doc.metadata.get("parent_id") == parent_id:
-                            parent_docs_map[parent_id] = doc
-                            break
+                    parent_docs_map[parent_id] = self.documents[self.document_id_map[parent_id]]
+        
 
         # 按相关性排序（匹配次数多的排在前面）
         sorted_parent_ids = sorted(parent_relevance.keys(),
@@ -370,5 +373,5 @@ class DataPreparationModule:
             relevance_count = parent_relevance.get(parent_id, 0)
             parent_info.append(f"{dish_name}({relevance_count}块)")
 
-        logger.info(f"从 {len(parent_ids)} 个子块中找到 {len(parent_docs)} 个去重父文档: {', '.join(parent_info)}")
+        logger.debug(f"从 {len(parent_ids)} 个子块中找到 {len(parent_docs)} 个去重父文档: {', '.join(parent_info)}")
         return parent_docs
