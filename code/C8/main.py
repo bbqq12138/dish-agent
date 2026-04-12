@@ -243,7 +243,7 @@ class RecipeRAGSystem:
             parent_id = chunk.metadata.get('parent_id')
             if parent_id is not None and isinstance(parent_id, str):
                 doc_ids.append(parent_id)
-        relevant_docs = data_module.get_documents(doc_ids)
+        relevant_docs = data_module.get_documents(doc_ids)  # 去重+根据父文档ID获取完整文档信息
 
 
         # 5. 检查是否找到相关内容并显示找到的文档名称

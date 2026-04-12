@@ -159,8 +159,6 @@ class RetrievalOptimizationModule:
 
         return rrf_reranked_docs # 这里只是返回chunks，而不是父文档
         
-    
-
     async def rerank_model_rerank(self, query: str, candidate_docs: List[Document], threshold: float = 0) -> List[Document]: 
         """
         对候选文档进行重排，这里使用 cross-encoder reranker 对候选文档进行打分，并根据分数进行排序，选择 top_k 个文档返回
@@ -174,6 +172,27 @@ class RetrievalOptimizationModule:
         for doc in candidate_docs:
             text_pairs.append((query, doc.page_content))  # 将菜谱名称和内容拼接起来作为文档的文本输入，供reranker模型打分使用
         
+        scores_seq = await self._rerank_text_pairs(text_pairs, threshold=threshold)
+
+        reranked_docs = []
+        for score, seq in scores_seq:
+            candidate_docs[seq].metadata['rerank_score'] = score  # 将重排得分添加到文档的元数据中，方便后续分析和调试
+            reranked_docs.append(candidate_docs[seq])
+        
+        return reranked_docs
+    
+
+    async def _rerank_text_pairs(self, text_pairs: List[tuple[str, str]], threshold: float = 0) -> List[tuple[float, int]]: 
+        """
+        使用Reranker模型对文本对进行打分
+        根据分数进行重排序，返回 (得分， 文本索引)
+        并根据阈值过滤掉得分过低的文本对，避免返回无关文档
+
+        Args:
+            text_pairs: 文本对列表
+            threshold: 相关性阈值
+        """      
+          
         if not self.qdrant_client.reranker:
             logger.error("Reranker模型未设置，无法进行重排")
             raise ValueError("Reranker模型未设置，无法进行重排")
@@ -183,22 +202,19 @@ class RetrievalOptimizationModule:
         if scores is None:
             logger.error("重排过程中出现错误，无法获取文档得分")
             raise ValueError("重排过程中出现错误，无法获取文档得分")
-        scores_seq = [(score, i) for i, score in enumerate(scores)]
+        
+        scores_seq = []
+        for i, score in enumerate(scores):
+            if score >= threshold:  # 这里设置一个阈值，过滤掉得分过低的文本对，避免返回无关文档
+                scores_seq.append((score, i))  # (得分, 文本索引)
+                
         scores_seq.sort(reverse=True, key=(lambda x: x[0]))
+
+
+        logger.info(f"应用重排得分阈值 {threshold}，原候选子文档数: {len(text_pairs)}, 过滤掉得分低于阈值的 {len(text_pairs) - len(scores_seq)} 个文档，剩余 {len(scores_seq)} 个文档")
         logger.debug(scores_seq)
 
-        reranked_docs = []
-        for score, seq in scores_seq:
-            candidate_docs[seq].metadata['rerank_score'] = score  # 将重排得分添加到文档的元数据中，方便后续分析和调试
-            reranked_docs.append(candidate_docs[seq])
-
-        if threshold > 0:
-            reranked_docs = [doc for doc in reranked_docs if doc.metadata.get('rerank_score') >= threshold]
-            logger.info(f"应用重排得分阈值 {threshold}，过滤掉得分低于阈值的 {len(candidate_docs) - len(reranked_docs)} 个文档，剩余 {len(reranked_docs)} 个文档")
-
-        logger.debug(f"重排完成，原候选文档数: {len(candidate_docs)}, 重排后文档数: {len(reranked_docs)}")
-        
-        return reranked_docs
+        return scores_seq
     
 
     def _rrf_rerank(self, vector_docs: List[Document], bm25_docs: List[Document], top_k: int = 5, k: int = 60, vector_weight: float = 0.6) -> List[Document]:
@@ -257,21 +273,7 @@ class RetrievalOptimizationModule:
         logger.debug(f"RRF重排完成: 向量检索{len(vector_docs)}个文档, BM25检索{len(bm25_docs)}个文档, 合并后{len(reranked_docs)}个文档")
 
         return reranked_docs
-
-    def _unique_documents(self, docs1: List[Document], docs2: List[Document]) -> List[Document]:
-        """合并两个文档列表，并去重，去重的依据是文档的父文档ID（parent_id），如果两个文档的parent_id相同，则认为是重复的，只保留一个"""
-        unique_docs = []
-        for doc2 in docs2:
-            is_repeat = False
-            for doc1 in docs1:
-                if doc2.metadata.get('chunk_id') == doc1.metadata.get('chunk_id'):
-                    is_repeat = True
-                    break
-            
-            if not is_repeat:
-                unique_docs.append(doc2)
-
-        return unique_docs + docs1
+    
 
     async def hyde_search(self, query: str, top_k: int = 5, threshold: float = 0.25, vector_weight: float = 1.0) -> List[Document]:
         """
@@ -332,7 +334,8 @@ class RetrievalOptimizationModule:
             [SystemMessage(content=hyde_cot_prompt)], 
             response_format= {"type": "json_object"}    # API结构化输出指令
         )
-        # 2. 生成的结果为JSON对象，解析出hyde_recipes字段，作为后续检索的查询条件
+
+        # 2. 生成的结果为JSON对象，解析出 hyde_documents 字段，作为后续检索的查询条件
         try:
             hyde_recipes = json.loads(s=hyde_result.content) # type: ignore
         except json.JSONDecodeError as e:
@@ -351,29 +354,40 @@ class RetrievalOptimizationModule:
         if hyde_docs:
             res_chunkses = await self.hybrid_search(hyde_docs, top_k=2 * top_k // len(hyde_docs), vector_weight=vector_weight)   # 这里直接用混合检索，利用生成的hyde_docs去进行向量检索，获取相关文档
             
-            for i, chunks in enumerate(res_chunkses):
-                logger.debug(f"使用假想文档 {i+1} 进行检索，得到 {len(chunks)} 个相关文档块")
-                # for chunk in chunks:
-                #     logger.info(f"假想文档 {i+1} 的检索结果文档块菜名: {chunk.metadata.get('dish_name')}")
-                sort_chunks = await self.rerank_model_rerank(hyde_docs[i], chunks)  # 对每个假想文档检索到的文档进行重排，使用假想文档作为query，得到更相关的文档块
-                res_chunks.extend(sort_chunks)
+            candidate_chunks = []
+            text_pairs = []
+            for hyde_doc, chunks in zip(hyde_docs, res_chunkses):
+                for chunk in chunks:
+                    text_pairs.append((hyde_doc, chunk.page_content))  # 将hyde_doc作为query，chunk的内容作为文档输入，供reranker模型打分使用
+                    candidate_chunks.append(chunk)  
+
+            scores_seq = await self._rerank_text_pairs(text_pairs, threshold)  # 对每个假想文档检索到的文档进行重排，使用假想文档作为query，得到更相关的文档块 
+
+            res_chunks = [candidate_chunks[seq] for _, seq in scores_seq]
         else:
             res_chunkss = await self.hybrid_search(query, top_k=top_k, vector_weight=vector_weight)   # 如果HyDE没有生成有效的文档，就退化到普通的混合检索
             res_chunks = await self.rerank_model_rerank(query, res_chunkss[0]) if res_chunkss else []
 
 
-        # 4. 对取得的所有文档块进行重排，选取相关度最高的top_k个返回，小于阈值的过滤掉，避免返回无关文档
-        res_chunks.sort(key=lambda x: x.metadata['rerank_score'], reverse=True)
-    
-        cot = 0
-        while cot < top_k and res_chunks[cot].metadata['rerank_score'] >= threshold:  # 这里设置一个阈值，过滤掉相关度过低的文档块，避免返回无关文档
-            cot += 1
-        
-        if cot > 0:
-            logger.debug(f"🔍HyDE检索完成:  检索并重排后返回{cot}个文档块")
+        # 4. 对检索结果进行去重，去重的依据是文档的父文档ID（parent_id），如果两个文档的parent_id相同，则认为是重复的，只保留一个
+        parent_id_set = set()
+        unique_res_chunks = []
+        for chunk in res_chunks:
+            if chunk.metadata.get('parent_id') not in parent_id_set:
+                if len(parent_id_set) >= top_k:
+                    continue
+                parent_id_set.add(chunk.metadata.get('parent_id'))
+                unique_res_chunks.append(chunk)
+            else:
+                unique_res_chunks.append(chunk)  
+
+        if len(parent_id_set) > 0:
+            logger.debug(f"🔍HyDE检索完成:  检索并重排后返回{len(parent_id_set)}个文档块")
         else: logger.debug(f"🔍HyDE检索完成: 没有文档块的相关度超过设定的阈值 {threshold}，未返回任何文档块")
 
-        return res_chunks[: cot]
+
+        return unique_res_chunks
+    
 
     def metadata_filtered_search(self, query: str, filters: Dict[str, Any], top_k: int = 5):
         pass

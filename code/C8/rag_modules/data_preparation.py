@@ -326,7 +326,20 @@ class DataPreparationModule:
         Returns:
             对应的子块文档列表
         """
-        result_chunks = [self.chunks[self.chunk_id_map[chunk_id]] for chunk_id in chunk_ids if chunk_id in self.chunk_id_map]
+        # 注意：返回副本而不是直接返回 self.chunks 中的缓存对象。
+        # 下游检索/重排过程会写 metadata（例如 rrf_score / rerank_score），
+        # 若直接返回缓存对象会导致不同查询之间相互覆盖，且并发时存在竞态。
+        result_chunks: List[Document] = []
+        for chunk_id in chunk_ids:
+            if chunk_id not in self.chunk_id_map:
+                continue
+            src = self.chunks[self.chunk_id_map[chunk_id]]
+            result_chunks.append(
+                Document(
+                    page_content=src.page_content,
+                    metadata=dict(src.metadata),
+                )
+            )
         return result_chunks
 
     def get_documents(self, parent_ids: List[str]) -> List[Document]:

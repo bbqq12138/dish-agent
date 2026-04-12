@@ -1,20 +1,22 @@
 import asyncio
-import random
 
 from langgraph.graph import START, END, StateGraph, MessagesState
 from langgraph.prebuilt import tool_node
 from langgraph.types import Send
 from typing import Annotated, Literal
-from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage
 import operator
 from branchGraph import BranchState
 from branchGraph import generate_branch_graph
 
+from pydantic import BaseModel, Field
+import json
 
 class Agent:
     def __init__(self, llm):
         self.app = None
         self.llm = llm
+
 
     class AgentState(MessagesState):
         query: str
@@ -22,6 +24,13 @@ class Agent:
         branch_categories: list[Literal["list", "detail", "general"]]
         branch_results: Annotated[list[str], operator.add]
         result: str
+
+    
+    class MultiQueryComposer(BaseModel):
+        """用于将用户的查询分解为一个或多个子查询，方便后续检索"""
+        analyze: str = Field(description="你对于用户查询的拆分思考过程")
+        queries: list[str] = Field(description="每个元素分别是分解后的子查询")
+
 
     async def multi_query_composer(self, state: AgentState) -> AgentState:
         """
@@ -36,25 +45,31 @@ class Agent:
         multi_query_composer_prompt = f"""
 你是一个美食系统的智能助手，美食系统负责回答用户关于菜品推荐、菜谱生成、菜品问答三方面的提问。
 
-用户的提问中可能包含多个问题，你需要对用户的问题进行分析并在必要的时候将其拆分成多个子问题。
+要求：
+ - 用户的提问中可能包含多个问题，你需要对用户的问题进行分析并在必要的时候将其拆分成多个子问题
+ - 你需要将拆分出来的子问题填入JSON对象中的 'queries' 字段，该字段类型为字符串列表
 
-如：
-- 用户提问：我想吃点清淡的菜，有什么推荐吗？还有宫保鸡丁怎么做？
-- 你需要拆分成两个子问题：1.推荐清淡菜 2.宫保鸡丁的做法
-- 用户提问：宫保鸡丁和红烧茄子哪个好吃？
-- 你需要拆分成两个子问题：1.宫保鸡丁怎么样 2.红烧茄子怎么样
+举例：
+ - 用户提问：我想吃点清淡的菜，有什么推荐吗？还有宫保鸡丁怎么做？
+   你需要拆分成两个子问题：[推荐清淡菜, 宫保鸡丁的做法]
+ - 用户提问：宫保鸡丁和红烧茄子哪个好吃？
+   你需要拆分成两个子问题：[宫保鸡丁怎么样, 红烧茄子怎么样]"""
 
-请直接将拆分后的多个子问题返回，以空格分隔，如：推荐清淡菜 宫保鸡丁的做法
+        messages = [
+            {'role': 'system', 'content': multi_query_composer_prompt}, 
+            {'role': 'user', 'content': state['query']}
+        ]
 
-用户问题：{state['query']}
+        response = await self.llm.ainvoke(
+            input = messages, 
+            temperature=0.3,
+            response_format = self.MultiQueryComposer,  # 底层chat.completion.parse会自动解析
+        )
 
-子问题:"""
-
-        result = await self.llm.ainvoke(([SystemMessage(content=multi_query_composer_prompt)]))
         try:
-            branch_queries = list(result.content.split(' '))
+            branch_queries = json.loads(response.content).get('queries', [])
         except Exception as e:
-            print(result)
+            print(response.content)
             print("多查询分解出错了")
             raise Exception(e)
 
@@ -75,16 +90,27 @@ class Agent:
         查询路由 - 根据查询类型选择不同的处理方式
         """
         query_router_prompt = f"""
-请根据用户的多个问题，将其依次分类为以下三种类型之一：
+根据用户的问题，将其分类为以下三种类型之一：
 
-1. 'list' - 用户想要获取菜品推荐或列表
-   例如：推荐几个素菜、有什么川菜、高血压适合吃什么菜、夜晚看球赛适合搭配什么菜
-
-2. 'detail' - 用户想要与菜品制作相关信息
-   例如：宫保鸡丁怎么做、制作步骤、需要什么食材
-
-3. 'general' - 针对菜品的其他一般性问题
-   例如：什么是川菜、菜品口味热量等特性
+1. 'list'：用户想要获取菜品列表或推荐，只需要菜名
+   例如：
+    - 推荐几个素菜
+    - 与茄子相关的菜有什么
+    - 今天外面下雪了，吃什么菜好呢？
+    - 我最近血糖有些高，有什么适合吃的菜吗？
+                                                  
+2. 'detail'：用户想要具体的制作方法或详细信息
+   例如：
+    - 宫保鸡丁怎么做                                          
+    - 宫保鸡丁的制作步骤、需要什么食材
+    - 宫保鸡丁的制作技巧
+                                                  
+3. 'general'：其他一般性问题
+   例如：
+    - 什么是川菜
+    - 宫保鸡丁的卡路里多少
+    - 做菜的基本技巧有哪些
+    - 如何判断菜是否熟了
 
 只返回分类结果：list、detail 或 general
 若有多个查询，则以空格分隔，如: list detail list
@@ -92,7 +118,7 @@ class Agent:
 用户问题: {'  '.join(state['branch_queries'])}
 
 分类结果:"""
-        class_res = await self.llm.ainvoke([SystemMessage(content=query_router_prompt)])
+        class_res = await self.llm.ainvoke([SystemMessage(content=query_router_prompt)], temperature=0.1)
         try:
             branch_categories = list(class_res.content.strip().split(' '))
         except Exception as e:
@@ -118,7 +144,7 @@ class Agent:
 
 
     def create_main_graph(self):
-        branch_graph = generate_branch_graph()  # 生成子图节点
+        branch_graph = generate_branch_graph()  # 生成编译好的子图节点
 
         builder = StateGraph(self.AgentState)
         builder.add_node('multi_query_composer', self.multi_query_composer)
