@@ -1,24 +1,25 @@
-import asyncio
-
 from langgraph.graph import START, END, StateGraph, MessagesState
-from langgraph.prebuilt import tool_node
-from langgraph.types import Send
-from typing import Annotated, Literal
+from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import SystemMessage
+from langgraph.types import Send
+
+import json
+import asyncio
 import operator
+from pydantic import BaseModel, Field
+from typing import Annotated, Literal
+
 from branchGraph import BranchState
 from branchGraph import generate_branch_graph
 
-from pydantic import BaseModel, Field
-import json
 
-class Agent:
+class MainGraph:
     def __init__(self, llm):
         self.app = None
         self.llm = llm
 
 
-    class AgentState(MessagesState):
+    class MainState(MessagesState):
         query: str
         branch_queries: list[str]
         branch_categories: list[Literal["list", "detail", "general"]]
@@ -32,7 +33,7 @@ class Agent:
         queries: list[str] = Field(description="每个元素分别是分解后的子查询")
 
 
-    async def multi_query_composer(self, state: AgentState) -> AgentState:
+    async def multi_query_composer(self, state: MainState) -> dict:
         """
         多查询分解器 - 将用户查询拆分成多个子查询
 
@@ -46,14 +47,16 @@ class Agent:
 你是一个美食系统的智能助手，美食系统负责回答用户关于菜品推荐、菜谱生成、菜品问答三方面的提问。
 
 要求：
- - 用户的提问中可能包含多个问题，你需要对用户的问题进行分析并在必要的时候将其拆分成多个子问题
+ - 用户的提问中可能包含多个问题，你需要对用户的问题进行分析并将其拆分成多个独立的子问题，以便后续针对每个子问题进行检索和回答
  - 你需要将拆分出来的子问题填入JSON对象中的 'queries' 字段，该字段类型为字符串列表
 
 举例：
  - 用户提问：我想吃点清淡的菜，有什么推荐吗？还有宫保鸡丁怎么做？
-   你需要拆分成两个子问题：[推荐清淡菜, 宫保鸡丁的做法]
+   回答：[推荐清淡菜, 宫保鸡丁的做法]
  - 用户提问：宫保鸡丁和红烧茄子哪个好吃？
-   你需要拆分成两个子问题：[宫保鸡丁怎么样, 红烧茄子怎么样]"""
+   回答：[宫保鸡丁味道怎么样, 红烧茄子味道怎么样]
+
+注意：每个子问题应该是针对**一个菜品**，不要包含多个菜品，否则后续检索时无法准确匹配到相关的菜品信息"""
 
         messages = [
             {'role': 'system', 'content': multi_query_composer_prompt}, 
@@ -78,14 +81,17 @@ class Agent:
         return {'branch_queries': branch_queries}
 
 
-    def parallel_retrieval_router(self, state: AgentState):
+    def parallel_retrieval_router(self, state: MainState) -> list[Send]:
         sends = []
+
+        # 根据分类结果动态地并行发送检索请求
         for q, category in zip(state['branch_queries'], state['branch_categories']):
-            sends.append(Send('generate_subquery', BranchState(subquery=q, query_category=category)))
+            if category in ["list", "detail", "general"]:
+                sends.append(Send('generate_subquery', {'subquery': q, 'query_category': category}))
         return sends
 
 
-    async def multi_query_router(self, state: AgentState) -> AgentState:
+    async def multi_query_router(self, state: MainState) -> dict:
         """
         查询路由 - 根据查询类型选择不同的处理方式
         """
@@ -133,20 +139,24 @@ class Agent:
             raise Exception("分类结果数量与子查询数量不一致")
 
         return {'branch_categories': branch_categories}
+    
 
-
-    async def generate_answer(self, state: AgentState):
+    async def generate_answer(self, state: MainState):
         """
         生成最终回答
         """
-        pass
+        # 这里简单地将子查询结果拼接起来作为最终回答，实际应用中可以设计更复杂的答案生成逻辑
+        final_answer = " | ".join(state['branch_results'])
+        return {'result': final_answer}
 
 
 
-    def create_main_graph(self):
+    def compile_main_graph(self):
+        memory = InMemorySaver()
+
         branch_graph = generate_branch_graph()  # 生成编译好的子图节点
 
-        builder = StateGraph(self.AgentState)
+        builder = StateGraph(self.MainState)
         builder.add_node('multi_query_composer', self.multi_query_composer)
         builder.add_node('multi_query_router', self.multi_query_router)
         builder.add_node('generate_subquery', branch_graph)
@@ -162,4 +172,40 @@ class Agent:
         builder.add_edge('generate_subquery', 'generate')
         builder.add_edge('generate', END)
 
-        self.app = builder.compile()
+        self.app = builder.compile(checkpointer=memory)
+
+async def test():
+    import os
+    from dotenv import load_dotenv
+    from langchain.chat_models import init_chat_model
+    load_dotenv()
+
+    llm = init_chat_model(
+        model=os.getenv("MOONSHOT_MODEL_ID"),
+        model_provider='openai',
+        api_key=os.getenv("MOONSHOT_API_KEY"),
+        base_url=os.getenv("MOONSHOT_BASE_URL"),
+        temperature=0.2,
+    )
+
+    agent = MainGraph(llm)
+    agent.compile_main_graph()
+
+    while True:
+        user_input = input("请输入你的问题（输入exit退出）：")
+        if user_input.lower() == "exit":
+            break
+
+        if agent.app is None:
+            print("主图还没有创建成功")
+            break
+
+        response = await agent.app.ainvoke(
+            input={"query": user_input}, # type: ignore
+            config={"configurable": {"thread_id": "thread-1"}},   
+        )
+        print("回答：", response['result'])
+
+
+if __name__ == "__main__":
+    asyncio.run(test())

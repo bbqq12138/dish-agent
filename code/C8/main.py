@@ -12,6 +12,8 @@ from typing import List, Literal, overload
 from huggingface_hub import login
 from langchain.chat_models import init_chat_model
 
+from mainGraph import MainGraph
+
 # 添加模块路径
 sys.path.append(str(Path(__file__).parent))
 
@@ -62,6 +64,7 @@ class RecipeRAGSystem:
         self.index_module: IndexConstructionModule | None = None
         self.retrieval_module: RetrievalOptimizationModule | None = None
         self.generation_module: GenerationIntegrationModule | None = None
+        self.main_graph: MainGraph | None = None
         self.llm = None
 
         # 检查数据路径
@@ -72,7 +75,8 @@ class RecipeRAGSystem:
         if not os.getenv("MOONSHOT_API_KEY"):
             raise ValueError("请设置 MOONSHOT_API_KEY 环境变量")
     
-    def initialize_system(self):
+
+    def _initialize_system(self):
         """初始化所有模块"""
         print("🚀 正在初始化RAG系统...")
 
@@ -95,6 +99,12 @@ class RecipeRAGSystem:
         # 3. 初始化生成集成模块
         print("🤖 初始化生成集成模块...")
         self.generation_module = GenerationIntegrationModule(llm=self.llm)
+
+
+        # 4. 编译LangGraph主图
+        print("🔧 编译LangGraph主图...")
+        self.main_graph = MainGraph(self.llm)
+        self.main_graph.compile_main_graph()
 
         print("✅ 系统初始化完成！")
 
@@ -371,7 +381,7 @@ class RecipeRAGSystem:
         print("💡 解决您的选择困难症，告别'今天吃什么'的世纪难题！")
         
         # 初始化系统
-        self.initialize_system()
+        self._initialize_system()
         
         # 构建知识库
         await self.build_knowledge_base()
@@ -392,9 +402,11 @@ class RecipeRAGSystem:
                 print("\n回答:")
                 if use_stream:
                     # 流式输出
+
                     stream_iter = await self.ask_question(user_input, stream=True)
                     async for output_chunk in stream_iter:
                         print(output_chunk, end="", flush=True)
+                    
                     print("\n")
                 else:
                     # 普通输出
