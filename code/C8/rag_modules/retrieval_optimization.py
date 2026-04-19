@@ -6,15 +6,18 @@ import logging
 import os
 import json
 import asyncio
+from dotenv import load_dotenv
 from typing import List, Dict, Any
 
 from langchain_core.documents import Document
 from langchain_core.messages import SystemMessage
 from langchain.chat_models import init_chat_model, BaseChatModel
-from FlagEmbedding import FlagReranker
+from dashscope import TextReRank
 from qdrant_client import models as qdrant_models
 from .myQdrant import Qdrant
 from .data_preparation import DataPreparationModule
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +32,7 @@ class RetrievalOptimizationModule:
     PS：元数据过滤需要精心的设计和维护菜谱的元数据标签体系，才能发挥作用，否则可能会出现过度过滤或过滤不足的情况，导致检索结果不理想，这里目前还没有实现
     """
     
-    def __init__(self, data_module: DataPreparationModule, qdrant_client: Qdrant, collection_name: str, llm, hyde_llm_config: dict, reranker_config: dict):
+    def __init__(self, data_module: DataPreparationModule, qdrant_client: Qdrant, collection_name: str, llm, hyde_llm_config: dict, rerank_api_config: dict):
         """
         初始化检索优化模块
         
@@ -39,17 +42,18 @@ class RetrievalOptimizationModule:
             collection_name: 向量数据库集合名称
             llm: 
             hyde_llm_config: 假设性文档生成模型配置
-            reranker_config: 重排模型配置
+            rerank_api_config: 重排模型配置
         """
         self.data_module = data_module
         self.qdrant_client = qdrant_client
         self.collection_name = collection_name
         self.llm: BaseChatModel = llm
         self.hyde_llm: BaseChatModel
-        self._init_retrieval_module(hyde_llm_config, reranker_config)
-    
+        self.rerank_api_config = rerank_api_config
+        self._init_retrieval_module(hyde_llm_config)
 
-    def _init_retrieval_module(self, hyde_llm_config:dict, reranker_config:dict):
+
+    def _init_retrieval_module(self, hyde_llm_config:dict):
         try: 
             self.hyde_llm = init_chat_model(
                 model=hyde_llm_config['model_name'], 
@@ -62,22 +66,8 @@ class RetrievalOptimizationModule:
             logger.error(f"HyDE LLM 初始化失败: {e}")
             raise ValueError("HyDE LLM 初始化失败")
         
-        try: 
-            self.qdrant_client.set_reranker(
-                FlagReranker(
-                    model_name_or_path=reranker_config.get('model_name', 'BAAI/bge-reranker-v2-m3'), 
-                    use_fp16=reranker_config.get('use_fp16', True), 
-                    cache_dir=reranker_config.get('cache_dir', '/tmp/reranker-model/'),
-                    normalize=True, 
-                )
-            )
-        except Exception as e:
-            logger.error(f"Reranker 模型设置失败: {e}")
-            raise ValueError("Reranker 模型设置失败")
-        
         logger.info(f"HyDE LLM 初始化完成，使用模型: {hyde_llm_config['model_name']}，温度: {hyde_llm_config['temperature']}")
-        logger.info(f"Reranker 模型设置完成，使用模型: {reranker_config.get('model_name', 'BAAI/bge-reranker-v2-m3')}, \
-                    use_fp16: {reranker_config.get('use_fp16', True)}, cache_dir: {reranker_config.get('cache_dir', '/tmp/reranker-model/')}")
+
         
     
     async def hybrid_search(self, query: str | List[str], top_k: int = 5, vector_weight: float = 0.6) -> list[list[Document]]: # weight参数用于调整BM25和向量检索在RRF重排中的权重，默认BM25占0.4，向量检索占0.6
@@ -155,66 +145,32 @@ class RetrievalOptimizationModule:
             #     print(chunk.metadata['dish_name'])
 
             rrf_reranked_docs.append(self._rrf_rerank(vector_chunks, bm25_chunks, top_k=top_k, vector_weight=vector_weight))  # 每个查询都进行RRF重排，并选取top_k个结果
-    
 
         return rrf_reranked_docs # 这里只是返回chunks，而不是父文档
         
-    async def rerank_model_rerank(self, query: str, candidate_docs: List[Document], threshold: float = 0) -> List[Document]: 
-        """
-        对候选文档进行重排，这里使用 cross-encoder reranker 对候选文档进行打分，并根据分数进行排序，选择 top_k 个文档返回
+    
+    async def api_rerank(self, query: str, candidate_docs: List[Document], instruct: str | None = None, threshold: float = 0) -> List[Document]: 
+        response = await asyncio.to_thread(
+            TextReRank.call, 
+            model=self.rerank_api_config['rerank_api_model'], 
+            query=query,
+            documents=[doc.page_content for doc in candidate_docs], 
+            api_key=os.getenv("ALI_API_KEY") or '', 
+            instruct=instruct
+        )
 
-        Args:
-            query: 查询文本
-            candidate_docs: 候选文档列表
-            threshold: 相关性阈值，只有得分高于该阈值的文档才会被返回，默认为0，即不进行过滤
-        """
-        text_pairs = []
-        for doc in candidate_docs:
-            text_pairs.append((query, doc.page_content))  # 将菜谱名称和内容拼接起来作为文档的文本输入，供reranker模型打分使用
-        
-        scores_seq = await self._rerank_text_pairs(text_pairs, threshold=threshold)
+        index_scores = response.output.results
+        res_message = f"reranke调用完成，查询: {query}\n" + '\n'.join([f"文档: {candidate_docs[index_score.index].metadata['dish_name']} 得分: {index_score.relevance_score:.4f}" for index_score in index_scores])
+        logger.debug(res_message)
 
         reranked_docs = []
-        for score, seq in scores_seq:
-            candidate_docs[seq].metadata['rerank_score'] = score  # 将重排得分添加到文档的元数据中，方便后续分析和调试
-            reranked_docs.append(candidate_docs[seq])
+        for index_score in index_scores:
+            if index_score.relevance_score < threshold:
+                break
+            candidate_docs[index_score.index].metadata['rerank_score'] = index_score.relevance_score  # 将重排得分添加到文档的元数据中，方便后续分析和调试
+            reranked_docs.append(candidate_docs[index_score.index])
         
         return reranked_docs
-    
-
-    async def _rerank_text_pairs(self, text_pairs: List[tuple[str, str]], threshold: float = 0) -> List[tuple[float, int]]: 
-        """
-        使用Reranker模型对文本对进行打分
-        根据分数进行重排序，返回 (得分， 文本索引)
-        并根据阈值过滤掉得分过低的文本对，避免返回无关文档
-
-        Args:
-            text_pairs: 文本对列表
-            threshold: 相关性阈值
-        """      
-          
-        if not self.qdrant_client.reranker:
-            logger.error("Reranker模型未设置，无法进行重排")
-            raise ValueError("Reranker模型未设置，无法进行重排")
-        
-        scores = await asyncio.to_thread(self.qdrant_client.reranker.compute_score, text_pairs)
-
-        if scores is None:
-            logger.error("重排过程中出现错误，无法获取文档得分")
-            raise ValueError("重排过程中出现错误，无法获取文档得分")
-        
-        scores_seq = []
-        for i, score in enumerate(scores):
-            if score >= threshold:  # 这里设置一个阈值，过滤掉得分过低的文本对，避免返回无关文档
-                scores_seq.append((score, i))  # (得分, 文本索引)
-                
-        scores_seq.sort(reverse=True, key=(lambda x: x[0]))
-
-
-        logger.info(f"应用重排得分阈值 {threshold}，原候选子文档数: {len(text_pairs)}, 过滤掉得分低于阈值的 {len(text_pairs) - len(scores_seq)} 个文档，剩余 {len(scores_seq)} 个文档")
-        logger.debug(scores_seq)
-
-        return scores_seq
     
 
     def _rrf_rerank(self, vector_docs: List[Document], bm25_docs: List[Document], top_k: int = 5, k: int = 60, vector_weight: float = 0.6) -> List[Document]:
@@ -275,7 +231,7 @@ class RetrievalOptimizationModule:
         return reranked_docs
     
 
-    async def hyde_search(self, query: str, top_k: int = 5, threshold: float = 0.25, vector_weight: float = 1.0) -> List[Document]:
+    async def hyde_search(self, query: str, top_k: int = 5, search_threshold: float = 0.5, match_threshold: float = 0.4, vector_weight: float = 1.0) -> List[Document]:
         """
         HYDE检索 - 先让大模型根据查询生成一个假想的文档，然后用这个文档去进行向量检索，最后重排
         PS：由于实际测试稀疏向量检索效果很差，所以不召回稀疏向量检索结果
@@ -283,7 +239,8 @@ class RetrievalOptimizationModule:
         Args:
             query: 查询文本
             top_k: 返回结果数量
-            threshold: 相关性阈值
+            search_threshold: 搜索相关性阈值
+            match_threshold: 匹配相关性阈值
             vector_weight: 向量检索的权重（BM25很多时候相关性不高，可以降低它的权重）
         Returns:
             检索到的文档列表
@@ -344,7 +301,7 @@ class RetrievalOptimizationModule:
 
         analyze = hyde_recipes.get('analyze', [])
         hyde_docs = hyde_recipes.get('hyde_documents', [])
-        logger.info(f"\nHyDE分析结果: {analyze}\nHyDE生成了 {len(hyde_docs)} 个假想文档")
+        logger.debug(f"\nHyDE分析结果: {analyze}\nHyDE生成了 {len(hyde_docs)} 个假想文档")
 
         logger.debug(f"HyDE生成的假想文档: {hyde_docs}")
 
@@ -354,20 +311,29 @@ class RetrievalOptimizationModule:
         if hyde_docs:
             res_chunkses = await self.hybrid_search(hyde_docs, top_k=2 * top_k // len(hyde_docs), vector_weight=vector_weight)   # 这里直接用混合检索，利用生成的hyde_docs去进行向量检索，获取相关文档
             
-            candidate_chunks = []
-            text_pairs = []
+            res_chunks = []
             for hyde_doc, chunks in zip(hyde_docs, res_chunkses):
-                for chunk in chunks:
-                    text_pairs.append((hyde_doc, chunk.page_content))  # 将hyde_doc作为query，chunk的内容作为文档输入，供reranker模型打分使用
-                    candidate_chunks.append(chunk)  
+                res_chunks.extend(
+                    await self.api_rerank(
+                        query=hyde_doc, 
+                        candidate_docs=chunks,
+                        instruct=self.rerank_api_config['match_rerank_instruct'], 
+                        threshold=match_threshold
+                    )
+                )  # 对每个假想文档检索到的文档进行重排，使用假想文档作为query，得到更相关的文档块 
+            
+            res_chunks.sort(key=lambda chunk: chunk.metadata.get('rerank_score', 0), reverse=True)  # 三个假设性文档检索结果间重排
 
-            scores_seq = await self._rerank_text_pairs(text_pairs, threshold)  # 对每个假想文档检索到的文档进行重排，使用假想文档作为query，得到更相关的文档块 
-
-            res_chunks = [candidate_chunks[seq] for _, seq in scores_seq]
         else:
             res_chunkss = await self.hybrid_search(query, top_k=top_k, vector_weight=vector_weight)   # 如果HyDE没有生成有效的文档，就退化到普通的混合检索
-            res_chunks = await self.rerank_model_rerank(query, res_chunkss[0]) if res_chunkss else []
-
+            
+            res_chunks = await self.api_rerank(
+                query=query, 
+                candidate_docs=res_chunkss[0], 
+                instruct=self.rerank_api_config['search_rerank_instruct'], 
+                threshold=search_threshold
+            )
+        logger.debug(f"HyDE检索得到 {len(res_chunks)} 个相关文档块，准备进行去重和最终返回")
 
         # 4. 对检索结果进行去重，去重的依据是文档的父文档ID（parent_id），如果两个文档的parent_id相同，则认为是重复的，只保留一个
         parent_id_set = set()
@@ -383,7 +349,7 @@ class RetrievalOptimizationModule:
 
         if len(parent_id_set) > 0:
             logger.debug(f"🔍HyDE检索完成:  检索并重排后返回{len(parent_id_set)}个文档块")
-        else: logger.debug(f"🔍HyDE检索完成: 没有文档块的相关度超过设定的阈值 {threshold}，未返回任何文档块")
+        else: logger.debug(f"🔍HyDE检索完成: 没有文档块的相关度超过设定的阈值 {match_threshold}，未返回任何文档块")
 
 
         return unique_res_chunks

@@ -342,7 +342,7 @@ class DataPreparationModule:
             )
         return result_chunks
 
-    def get_documents(self, parent_ids: List[str]) -> List[Document]:
+    async def get_documents(self, parent_ids: List[str]) -> List[Document]:
         """
         根据子块返回的父文档ids来获取对应的父文档（智能去重）
 

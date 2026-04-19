@@ -12,6 +12,7 @@ from langchain_core.documents import Document
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
+
 logger = logging.getLogger(__name__)
 
 class GenerationIntegrationModule:
@@ -25,96 +26,31 @@ class GenerationIntegrationModule:
             llm: 大语言模型实例
         """
         self.llm = llm
-    
-    async def generate_basic_answer(self, query: str, context_docs: List[Document]) -> str:
-        """
-        生成基础回答
 
-        Args:
-            query: 用户查询
-            context_docs: 上下文文档列表
+    @staticmethod
+    async def multi_query_summary(tagged_llm, query: str, relevant_docs: list[Document] | list[str]) -> str:
+        context = "\n\n".join(list(doc.page_content if isinstance(doc, Document) else doc for doc in relevant_docs))
 
-        Returns:
-            生成的回答
-        """
-        context = self._build_context(context_docs)
+        prompt = f"""
+你是一个美食系统的智能助手，美食系统负责回答用户关于菜品推荐、菜谱生成、菜品问答三方面的提问。
+你的任务是根据用户的查询和相关的查询结果，生成一个最终的回答。
 
-        prompt = ChatPromptTemplate.from_template("""
-你是一位专业的烹饪助手。请根据以下食谱信息回答用户的问题。
 
-用户问题: {question}
-
-相关食谱信息:
-{context}
-
-请提供详细、实用的回答。如果信息不足，请诚实说明。
-
-回答:""")
-
-        # 使用LCEL构建链
-        chain = (
-            {"question": RunnablePassthrough(), "context": lambda _: context}
-            | prompt
-            | self.llm
-            | StrOutputParser()
+相关查询结果：
+{context}"""
+        
+        final_answer = await tagged_llm.ainvoke(
+            input=[
+                {'role': 'system', 'content': prompt},
+                {'role': 'user', 'content': query}
+            ], 
+            temperature=0.7
         )
 
-        response = chain.invoke(query)
-        return response
+        return final_answer.content
     
-    async def generate_step_by_step_answer(self, query: str, context_docs: List[Document]) -> str:
-        """
-        生成分步骤回答
 
-        Args:
-            query: 用户查询
-            context_docs: 上下文文档列表
-
-        Returns:
-            分步骤的详细回答
-        """
-        context = self._build_context(context_docs)
-
-        prompt = ChatPromptTemplate.from_template("""
-你是一位专业的烹饪导师。请根据食谱信息和用户请求，为用户提供详细的分步骤指导。
-
-用户问题: {question}
-
-相关食谱信息:
-{context}
-
-请灵活组织回答，建议包含以下部分（可根据实际内容调整）：
-
-## 🥘 菜品介绍
-[简要介绍菜品特点和难度]
-
-## 🛒 所需食材
-[列出主要食材和用量]
-
-## 👨‍🍳 制作步骤
-[详细的分步骤说明，每步包含具体操作和大概所需时间]
-
-## 💡 制作技巧
-[仅在有实用技巧时包含。优先使用原文中的实用技巧，如果原文的"附加内容"与烹饪无关或为空，可以基于制作步骤总结关键要点，或者完全省略此部分]
-
-注意：
-- 如果没有相关食谱信息，请直接回答 "抱歉，没有找到相关食谱信息，无法提供详细指导。请更改描述或尝试其他查询。"
-- 根据实际内容和用户请求灵活调整结构，回答要满足用户需求，但不需要为了满足结构而填充无关内容
-- 如：用户只需要食材那就只输出食材部分，用户需要制作步骤那就全部输出
-
-回答:""")
-
-        chain = (
-            {"question": RunnablePassthrough(), "context": lambda _: context}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        response = await chain.ainvoke(query)
-        return response
-    
-    def query_rewrite(self, query: str) -> str:
+    async def query_rewrite(self, query: str) -> str:
         """
         智能查询重写 - 让大模型判断是否需要重写查询
 
@@ -159,23 +95,18 @@ class GenerationIntegrationModule:
             input_variables=["query"]
         )
 
-        chain = (
-            {"query": RunnablePassthrough()}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        response = chain.invoke(query).strip()
+        response = (await self.llm.ainvoke(
+            input = prompt.format(query=query), 
+            temperature=0.3, 
+        )).content.strip()
 
         # 记录重写结果
         if response != query:
-            logger.info(f"查询已重写: '{query}' → '{response}'")
+            logger.debug(f"查询已重写: '{query}' → '{response}'")
         else:
-            logger.info(f"查询无需重写: '{query}'")
+            logger.debug(f"查询无需重写: '{query}'")
 
         return response
-
 
 
     def query_router(self, query: str) -> str:
@@ -233,7 +164,9 @@ class GenerationIntegrationModule:
         else:
             return 'general'  # 默认类型
 
-    async def generate_list_answer(self, query: str, context_docs: List[Document]) -> str:
+    
+    @classmethod
+    async def generate_list_answer(cls, tagged_llm, query: str, context_docs: List[Document]) -> str:
         """
         生成列表式回答 - 适用于推荐类查询
 
@@ -246,7 +179,7 @@ class GenerationIntegrationModule:
         """
 
         # dish_context = "\n\n".join(list(doc.page_content for doc in context_docs))
-        context = self._build_context(context_docs)
+        context = cls._build_context(context_docs)
 
         list_answer_prompt = f"""你是一个菜品推荐助手。根据用户的提问和相关的菜品资料，生成一个简洁的推荐列表回答。
 
@@ -266,104 +199,29 @@ class GenerationIntegrationModule:
 
 用户问题: {query}"""
         
-        result = await self.llm.ainvoke(
+        result = await tagged_llm.ainvoke(
             input=[SystemMessage(content=list_answer_prompt)], 
             temperature=0.6, 
         )
 
-        return result.content.strip()
+        return result.content
 
 
-    async def generate_list_answer_stream(self, query: str, context_docs: List[Document]):
+    @classmethod
+    async def generate_step_by_step_answer(cls, tagged_llm, query: str, context_docs: List[Document]) -> str:
         """
-        生成列表式回答 - 适用于推荐类查询
+        生成分步骤回答
 
         Args:
             query: 用户查询
             context_docs: 上下文文档列表
 
         Returns:
-            列表式回答
+            分步骤的详细回答
         """
+        context = cls._build_context(context_docs)
 
-        context = self._build_context(context_docs)
-        list_answer_prompt = f"""你是一个菜品推荐助手。根据用户的提问和相关的菜品资料，生成一个简洁的推荐列表回答。
-
-格式：
-1. 菜品名称，理由
-2. 菜品名称，理由
-...
-
-
-要求：
- - 请严格按照上述格式生成回答
- - 根据用户的要求和资料选择其中最相关的菜品，推荐理由可以简短说明，当不需要理由时可以省略
- - 当没有与用户要求相关的菜品信息时，请直接返回 "抱歉，没有找到相关的菜品信息，无法提供推荐。请更改描述或尝试其他查询。"
-
-相关菜品信息:
-{context}
-
-用户问题: {query}"""
-        
-
-        stream_iter = self.llm.astream(
-            input=[SystemMessage(content=list_answer_prompt)], 
-            temperature=0.6,
-        )
-
-        async for output_chunk in stream_iter:
-            yield output_chunk.content      # yield 返回生成器而不是直接返回值或返回协程，因此 async 函数使用yield，返回的是异步生成器
-
-
-    async def generate_basic_answer_stream(self, query: str, context_docs: List[Document]):
-        """
-        生成基础回答 - 流式输出
-
-        Args:
-            query: 用户查询
-            context_docs: 上下文文档列表
-
-        Yields:
-            生成的回答片段
-        """
-        context = self._build_context(context_docs)
-
-        prompt = ChatPromptTemplate.from_template("""
-你是一位专业的烹饪助手。请根据以下食谱信息回答用户的问题。
-
-用户问题: {question}
-
-相关食谱信息:
-{context}
-
-请提供详细、实用的回答。如果信息不足，请诚实说明。
-
-回答:""")
-
-        chain = (
-            {"question": RunnablePassthrough(), "context": lambda _: context}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        async for chunk in chain.astream(query):
-            yield chunk
-
-    async def generate_step_by_step_answer_stream(self, query: str, context_docs: List[Document]):
-        """
-        生成详细步骤回答 - 流式输出
-
-        Args:
-            query: 用户查询
-            context_docs: 上下文文档列表
-
-        Yields:
-            详细步骤回答片段
-        """
-        context = self._build_context(context_docs)
-
-        prompt = ChatPromptTemplate.from_template("""
+        prompt_template = ChatPromptTemplate.from_template("""
 你是一位专业的烹饪导师。请根据食谱信息和用户请求，为用户提供详细的分步骤指导。
 
 用户问题: {question}
@@ -383,7 +241,7 @@ class GenerationIntegrationModule:
 [详细的分步骤说明，每步包含具体操作和大概所需时间]
 
 ## 💡 制作技巧
-[仅在有实用技巧时包含。如果原文的"附加内容"与烹饪无关或为空，可以基于制作步骤总结关键要点，或者完全省略此部分]
+[仅在有实用技巧时包含。优先使用原文中的实用技巧，如果原文的"附加内容"与烹饪无关或为空，可以基于制作步骤总结关键要点，或者完全省略此部分]
 
 注意：
 - 如果没有相关食谱信息，请直接回答 "抱歉，没有找到相关食谱信息，无法提供详细指导。请更改描述或尝试其他查询。"
@@ -392,17 +250,51 @@ class GenerationIntegrationModule:
 
 回答:""")
 
-        chain = (
-            {"question": RunnablePassthrough(), "context": lambda _: context}
-            | prompt
-            | self.llm
-            | StrOutputParser()
+        response = await tagged_llm.ainvoke(
+            input=[SystemMessage(content=prompt_template.format(question=query, context=context))], 
+            temperature=0.6,
         )
 
-        async for chunk in chain.astream(query):
-            yield chunk
+        return response.content
+    
 
-    def _build_context(self, docs: List[Document], max_length: int = 5000) -> str:
+    @classmethod
+    async def generate_basic_answer(cls, tagged_llm, query: str, context_docs: List[Document]) -> str:
+        """
+        生成基础回答
+
+        Args:
+            query: 用户查询
+            context_docs: 上下文文档列表
+
+        Returns:
+            生成的回答
+        """
+        context = cls._build_context(context_docs)
+
+        prompt = ChatPromptTemplate.from_template("""
+你是一位专业的烹饪助手。请根据以下食谱信息回答用户的问题。
+
+用户问题: {question}
+
+相关食谱信息:
+{context}
+
+请提供详细、实用的回答。如果信息不足，请诚实说明。
+
+回答:""")
+
+        response = await tagged_llm.ainvoke(
+            input=[SystemMessage(content=prompt.format(question=query, context=context))], 
+            temperature=0.6,
+        )
+
+        return response.content
+    
+
+
+    @staticmethod
+    def _build_context(docs: List[Document], max_length: int = 5000) -> str:
         """
         构建上下文字符串
         
@@ -434,7 +326,7 @@ class GenerationIntegrationModule:
             
             # 检查长度限制
             if current_length + len(doc_text) > max_length:
-                logger.info(f"达到上下文长度限制，已添加 {i-1} 条食谱信息")
+                logger.debug(f"达到上下文长度限制，已添加 {i-1} 条食谱信息")
                 break
             
             context_parts.append(doc_text)

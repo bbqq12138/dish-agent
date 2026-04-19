@@ -7,3 +7,14 @@ services:
       - "6334:6334" # gRPC
     volumes:
       - ./qdrant_data:/qdrant/storage # 数据持久化目录
+
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb_server
+    ports:
+      - "27017:27017" # MongoDB默认端口
+    volumes:
+      - ./mongodb_data:/data/db # 数据持久化目录
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=adminbbq

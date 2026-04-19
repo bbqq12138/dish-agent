@@ -1,32 +1,59 @@
 from langgraph.graph import START, END, StateGraph, MessagesState
 from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import Send
 
 import json
 import asyncio
-import operator
+import logging
 from pydantic import BaseModel, Field
 from typing import Annotated, Literal
+from rag_modules import GenerationIntegrationModule
 
-from branchGraph import BranchState
-from branchGraph import generate_branch_graph
+from branchGraph import SubGraph
+
+logger = logging.getLogger(__name__)
+
+def clearable_reducer(exist_list: list, new_item: list | str) -> list:
+    """自定义reducer函数，用于合并分支结果，并支持特殊的"清空"标志"""
+    if isinstance(new_item, str) and new_item.lower() == "clear":  # 如果新项是特殊的"清空"标志，则返回一个空列表
+        return []
+    
+    if isinstance(new_item, str):
+        new_item = [new_item]  # 将单个字符串转换为列表
+    return exist_list + new_item  # 如果新项是一个列表，则将其与现有列表合并
+
+
+class MainState(MessagesState):
+    query: str
+    branch_queries: list[str]
+    branch_categories: list[Literal["list", "detail", "general"]]
+    branch_results: Annotated[list[str], clearable_reducer]  # 默认自动合并结果，若传入"clear"则清空之前的结果
+    result: str
 
 
 class MainGraph:
     def __init__(self, llm):
         self.app = None
         self.llm = llm
+        self.compiled_subgraph = None
 
 
-    class MainState(MessagesState):
-        query: str
-        branch_queries: list[str]
-        branch_categories: list[Literal["list", "detail", "general"]]
-        branch_results: Annotated[list[str], operator.add]
-        result: str
-
+    async def generate_answer(self, state: MainState, config: RunnableConfig) -> dict:
+        """生成最终回答"""
+        if len(state['branch_queries']) <= 1:  # 如果只有一个查询，直接返回该查询的结果，无需再生成了
+            return {"result": state['branch_results'][0] if state['branch_results'] else "抱歉，我没有找到相关信息。"}
+        
+        stream_output_tags = config.get('configurable', {}).get("stream_output_tags", [])
+        result = await GenerationIntegrationModule.multi_query_summary(
+            self.llm.with_config(tags=stream_output_tags),
+            state["query"],
+            state["branch_results"],
+        )  # 将所有子查询的结果合并起来生成最终回答
+        return {"result": result}
     
+
     class MultiQueryComposer(BaseModel):
         """用于将用户的查询分解为一个或多个子查询，方便后续检索"""
         analyze: str = Field(description="你对于用户查询的拆分思考过程")
@@ -52,11 +79,15 @@ class MainGraph:
 
 举例：
  - 用户提问：我想吃点清淡的菜，有什么推荐吗？还有宫保鸡丁怎么做？
-   回答：[推荐清淡菜, 宫保鸡丁的做法]
+   回答：["推荐清淡菜", "宫保鸡丁的做法"]
  - 用户提问：宫保鸡丁和红烧茄子哪个好吃？
-   回答：[宫保鸡丁味道怎么样, 红烧茄子味道怎么样]
+   回答：["宫保鸡丁味道怎么样", "红烧茄子味道怎么样"]
+ - 用户提问：宫保鸡丁味道如何？辣不辣？
+   回答：["宫保鸡丁味道怎么样，宫保鸡丁辣不辣"]  # 这两个问题都针对宫保鸡丁，可以合并成一个子查询，方便后续检索时匹配到相关的菜品信息
 
-注意：每个子问题应该是针对**一个菜品**，不要包含多个菜品，否则后续检索时无法准确匹配到相关的菜品信息"""
+注意：
+ - 每个子问题应该是针对**一个菜品**，不要在一个子问题中包含多个菜品，否则后续检索时无法准确匹配到相关的菜品信息
+ - 若用户问题是针对一个菜品的多个方面，可以将这些问题合并成一个子查询，一个字问题不要包含多个菜品"""
 
         messages = [
             {'role': 'system', 'content': multi_query_composer_prompt}, 
@@ -69,11 +100,15 @@ class MainGraph:
             response_format = self.MultiQueryComposer,  # 底层chat.completion.parse会自动解析
         )
 
+        # response.additional_kwargs['parsed'] 自动解析为 Pydantic 对象中的 queries 属性
         try:
-            branch_queries = json.loads(response.content).get('queries', [])
+            if hasattr(response, 'additional_kwargs') and response.additional_kwargs.get('parsed'):
+                branch_queries = response.additional_kwargs['parsed'].queries
+            else:
+                branch_queries = json.loads(response.content).get('queries', [])
         except Exception as e:
-            print(response.content)
-            print("多查询分解出错了")
+            logger.debug(response.content)
+            logger.debug("多查询分解出错了")
             raise Exception(e)
 
         branch_queries = branch_queries[:5]     # 最多拆分成5个子查询，避免过多分支
@@ -87,7 +122,11 @@ class MainGraph:
         # 根据分类结果动态地并行发送检索请求
         for q, category in zip(state['branch_queries'], state['branch_categories']):
             if category in ["list", "detail", "general"]:
-                sends.append(Send('generate_subquery', {'subquery': q, 'query_category': category}))
+                sends.append(Send('generate_subquery', {
+                    'subquery': q, 
+                    'query_category': category, 
+                    'num_sub_queries': len(state['branch_queries'])
+                }))
         return sends
 
 
@@ -128,35 +167,26 @@ class MainGraph:
         try:
             branch_categories = list(class_res.content.strip().split(' '))
         except Exception as e:
-            print(class_res)
-            print("分类出现问题")
+            logger.debug(class_res)
+            logger.debug("分类出现问题")
             raise Exception(e)
 
-        print(state['branch_queries'])
-        print(branch_categories)
+        logger.debug(state['branch_queries'])
+        logger.debug(branch_categories)
 
         if len(branch_categories) != len(state['branch_queries']):
             raise Exception("分类结果数量与子查询数量不一致")
 
         return {'branch_categories': branch_categories}
-    
-
-    async def generate_answer(self, state: MainState):
-        """
-        生成最终回答
-        """
-        # 这里简单地将子查询结果拼接起来作为最终回答，实际应用中可以设计更复杂的答案生成逻辑
-        final_answer = " | ".join(state['branch_results'])
-        return {'result': final_answer}
 
 
-
-    def compile_main_graph(self):
+    def compile_main_graph(self, data_module=None, index_module=None, retrieval_module=None, generation_module=None):
         memory = InMemorySaver()
 
-        branch_graph = generate_branch_graph()  # 生成编译好的子图节点
+        self.compiled_subgraph = SubGraph(self.llm, data_module, index_module, retrieval_module, generation_module)
+        branch_graph = self.compiled_subgraph.compile_subgraph()  # 生成编译好的子图节点
 
-        builder = StateGraph(self.MainState)
+        builder = StateGraph(MainState)
         builder.add_node('multi_query_composer', self.multi_query_composer)
         builder.add_node('multi_query_router', self.multi_query_router)
         builder.add_node('generate_subquery', branch_graph)
@@ -197,14 +227,14 @@ async def test():
             break
 
         if agent.app is None:
-            print("主图还没有创建成功")
+            logger.info("主图还没有创建成功")
             break
 
         response = await agent.app.ainvoke(
             input={"query": user_input}, # type: ignore
             config={"configurable": {"thread_id": "thread-1"}},   
         )
-        print("回答：", response['result'])
+        logger.info("回答：", response['result'])
 
 
 if __name__ == "__main__":
