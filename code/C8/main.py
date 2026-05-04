@@ -9,7 +9,6 @@ import logging
 import warnings
 from pathlib import Path
 from collections.abc import AsyncIterator
-from typing import List, Literal, overload
 from huggingface_hub import login
 from langchain.chat_models import init_chat_model
 from langchain_core.runnables import RunnableConfig
@@ -80,7 +79,7 @@ class RecipeRAGSystem:
             raise ValueError("请设置 MOONSHOT_API_KEY 环境变量")
     
 
-    def _initialize_system(self):
+    async def _initialize_system(self):
         """初始化所有模块"""
         print("🚀  正在初始化RAG系统...")
 
@@ -90,7 +89,13 @@ class RecipeRAGSystem:
 
         # 1. 初始化数据准备模块
         print("初始化数据准备模块...")
-        self.data_module = DataPreparationModule(self.config.data_path)
+        self.data_module = await DataPreparationModule.create(
+            self.config.data_path,
+            self.config.mongodb_uri, 
+            self.config.mongodb_database,
+            self.config.documents_collection,
+            self.config.chunks_collection
+        )
 
         # 2. 初始化索引构建模块
         print("初始化索引构建模块...")
@@ -142,29 +147,36 @@ class RecipeRAGSystem:
         if self.index_module is None or self.data_module is None:
             raise ValueError("请先初始化系统")
 
+        # 0. 尝试加载菜谱文档和文本块，不存在则插入到MongoDB数据库中
+        if not await self.data_module.inspect_mongodb_strore(self.config.documents_collection):
+            print("未找到菜谱文档集合，正在加载并插入MongoDB数据库...")
+            await self.data_module.save_documents_to_mongodb(self.config.documents_collection)
+        if not await self.data_module.inspect_mongodb_strore(self.config.chunks_collection):
+            print("未找到文本块集合，正在进行文本分块并插入MongoDB数据库...")
+            await self.data_module.save_chunks_to_mongodb(self.config.chunks_collection)
+        print("✅  菜谱文档和文本块已准备就绪！")
+
         # 1. 尝试加载已保存的索引
+        # 如何不存在则重新构建documents和chunks，并构建其向量索引
         if await self.index_module.load_index():
             print("✅  成功加载已保存的向量索引！")
-            # 仍需要加载文档以获取统计信息和后续使用
-            print("加载食谱文档并进行分块...")
-            self.data_module.load_documents()
-            self.data_module.chunk_documents()
         else:
             print("未找到已保存的索引，开始构建新索引...")
 
-            # 2. 加载文档
-            print("加载食谱文档...")
-            self.data_module.load_documents()
+            # 1. 加载文档
+            if not self.data_module.documents:
+                self.data_module.load_documents()
 
-            # 3. 文本分块
-            print("进行文本分块...")
-            chunks = self.data_module.chunk_documents()
+            # 2. 文本分块
+            if not self.data_module.chunks:
+                self.data_module.chunk_documents()
 
-            # 4. 构建并保存向量索引
+            # 3. 构建并保存向量索引
             print("构建并保存向量索引...")
-            await self.index_module.build_vector_index(chunks)
+            await self.index_module.build_vector_index(self.data_module.chunks)
+        print("✅  向量索引已准备就绪！")
 
-        # 6. 初始化检索优化模块
+        # 2. 初始化检索优化模块
         print("初始化检索优化...")
         if self.index_module.qdrant_client is not None:
             self.retrieval_module = RetrievalOptimizationModule(
@@ -177,11 +189,11 @@ class RecipeRAGSystem:
             )
 
         # 7. 显示统计信息
-        stats = self.data_module.get_statistics()
+        stats = await self.data_module.get_statistics()
         print(f"\n📊  知识库统计:")
         print(f"   文档总数: {stats['total_documents']}")
         print(f"   文本块数: {stats['total_chunks']}")
-        print(f"   菜品分类: {list(stats['categories'].keys())}")
+        print(f"   菜品分类: {stats['categories']}")
         print(f"   难度分布: {stats['difficulties']}")
 
         print("✅  知识库构建完成！")
@@ -209,19 +221,26 @@ class RecipeRAGSystem:
 
             if not self.main_graph or not self.main_graph.app:
                 raise ValueError("请先初始化系统")
-
-            header_sent = False
+            
             
             async for event in self.main_graph.app.astream_events(
-                input={'query': question, 'branch_results': "clear"}, 
+                input={
+                    'query': question, 
+                    'branch_queries': [],
+                    'branch_categories': [],
+                    'branch_results': "clear",        # 防止上一轮结果污染当前对话
+                    'relevant_docs_total': "clear",   # 防止上一轮结果污染当前对话
+                    'result': "", 
+                }, 
                 config=self.main_graph_config, 
                 version="v2"
             ):
+                if event['event'] == "on_custom_event" and event['name'] == "docs_num_info":
+                    relevant_docs_total = event['data'].get('relevant_docs_total', '未知')
+                    yield f"🔍  查询完成！共检索到{relevant_docs_total}个相关文档\n" + "\n📣  回答：\n"
+
                 for llm_with_config in self.config.stream_output_tags:
                     if llm_with_config in event.get('tags', []) and event['event'] == 'on_chat_model_stream':
-                        if not header_sent:
-                            header_sent = True
-                            yield "🔍  查询完成！\n" + "\n📣  回答：\n"
                         yield event['data']['chunk'].content # type: ignore
 
 
@@ -230,8 +249,17 @@ class RecipeRAGSystem:
             return _stream_generator() 
         else:
             # 普通输出
-            result = await self.main_graph.app.ainvoke(input={'query': question, 'branch_results': "clear"}, config=self.main_graph_config)  # type: ignore
-            return result.get('result', '')
+            result = await self.main_graph.app.ainvoke(input={  # type: ignore
+                'query': question, 
+                'branch_queries': [],
+                'branch_categories': [],
+                'branch_results': "clear", 
+                'relevant_docs_total': "clear", 
+                'result': ""
+            }, config=self.main_graph_config)  
+
+            prints = f"🔍  查询完成！共检索到{result.get('relevant_docs_total', '未知')}个相关文档\n" + "\n📣  回答：\n"
+            return prints + result.get('result', '')
     
 
     async def run_interactive(self):
@@ -242,7 +270,7 @@ class RecipeRAGSystem:
         print("💡  解决您的选择困难症，告别'今天吃什么'的世纪难题！")
         
         # 初始化系统
-        self._initialize_system()
+        await self._initialize_system()
         
         # 构建知识库
         await self.build_knowledge_base()
@@ -279,8 +307,6 @@ class RecipeRAGSystem:
                 else:
                     # 普通输出
                     answer = await self.ask_question(user_input, stream=False)
-                    print("🔍  查询完成！\n")
-                    print("📣  回答：")
                     print(f"{answer}\n")
                 
             except KeyboardInterrupt:

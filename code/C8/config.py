@@ -21,6 +21,12 @@ class RAGConfig:
     collection_name: str = "RecipeChunk"
     qdrant_url: str = "http://localhost:6334"
 
+    # mongodb配置
+    mongodb_uri: str = os.getenv('MONGODB_URI', '')
+    mongodb_database: str = "dish_agent"
+    documents_collection: str = "recipe"
+    chunks_collection: str = "recipe_chunks"
+    
     # 模型配置
     embedding_model: str = "BAAI/bge-large-zh-v1.5"
     llm_model: str | None = os.getenv('MOONSHOT_MODEL_ID')

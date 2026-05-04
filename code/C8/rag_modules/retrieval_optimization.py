@@ -134,8 +134,8 @@ class RetrievalOptimizationModule:
             bm25_ids = list(point.payload['chunk_id'] for point in results[i*2+1].points if point.payload.get('chunk_id')) # type: ignore
         
 
-            vector_chunks = self.data_module.get_chunks(vector_ids)
-            bm25_chunks = self.data_module.get_chunks(bm25_ids)
+            vector_chunks = await self.data_module.get_chunks(vector_ids)
+            bm25_chunks = await self.data_module.get_chunks(bm25_ids)
 
             logger.debug(f"查询 {i+1}: 向量检索得到 {len(vector_chunks)} 个文档块，BM25检索得到 {len(bm25_chunks)} 个文档块")
             # for chunk in vector_chunks:

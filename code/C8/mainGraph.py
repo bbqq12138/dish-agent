@@ -1,7 +1,8 @@
 from langgraph.graph import START, END, StateGraph, MessagesState
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.callbacks.manager import dispatch_custom_event
 from langgraph.types import Send
 
 import json
@@ -24,12 +25,24 @@ def clearable_reducer(exist_list: list, new_item: list | str) -> list:
         new_item = [new_item]  # 将单个字符串转换为列表
     return exist_list + new_item  # 如果新项是一个列表，则将其与现有列表合并
 
+def int_add_reducer(a: int | None, b: int | str) -> int:
+    if a is None:
+        a = 0
+    
+    if isinstance(b, str):
+        if b.lower() == "clear":  # 如果新项是特殊的"清空"标志，则返回0
+            return 0
+        return a
+    
+    return a + b
+
 
 class MainState(MessagesState):
     query: str
     branch_queries: list[str]
     branch_categories: list[Literal["list", "detail", "general"]]
     branch_results: Annotated[list[str], clearable_reducer]  # 默认自动合并结果，若传入"clear"则清空之前的结果
+    relevant_docs_total: Annotated[int, int_add_reducer]  # 统计所有分支检索到的相关文档总数
     result: str
 
 
@@ -44,15 +57,77 @@ class MainGraph:
         """生成最终回答"""
         if len(state['branch_queries']) <= 1:  # 如果只有一个查询，直接返回该查询的结果，无需再生成了
             return {"result": state['branch_results'][0] if state['branch_results'] else "抱歉，我没有找到相关信息。"}
+
+        dispatch_custom_event(
+            name="docs_num_info",
+            data={"relevant_docs_total": state.get('relevant_docs_total', '未知')},
+            config=config,  
+        )
         
         stream_output_tags = config.get('configurable', {}).get("stream_output_tags", [])
-        result = await GenerationIntegrationModule.multi_query_summary(
+        response = await GenerationIntegrationModule.multi_query_summary(
             self.llm.with_config(tags=stream_output_tags),
             state["query"],
             state["branch_results"],
         )  # 将所有子查询的结果合并起来生成最终回答
-        return {"result": result}
-    
+
+        return {"result": response.content, "messages": [response]}
+
+
+    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+
+    async def query_rewrite_history(self, state: MainState) -> dict:
+        """根据对话历史查询重写"""
+        
+        messages = state.get('messages', [])
+        
+        # 💡 拦截器：如果没有历史对话（说明是第一轮提问），直接跳过重写，节省 Token 和时间！
+        # 假设 messages 里只包含了之前的历史，而当前最新的 query 在 state['query'] 中
+        # 或者如果 messages 里包含了最新的提问，那判断条件就是 len(messages) <= 1
+        if not messages:
+            return {'messages': [HumanMessage(content=state['query'])]}
+            
+        rewrite_system_prompt = """你是美食系统中专门处理多轮对话的查询重写专家。
+你的任务是：结合用户的【历史对话记录】，将用户的【最新提问】重写为一个独立、完整、且包含所有必要上下文的查询句子。
+
+严格遵守以下规则：
+1. 补全指代词：如果最新提问包含“它”、“这个”、“那个”、“另一道菜”等代词，必须根据历史对话将其替换为具体的菜名或实体。
+2. 补全省略主语：如果最新提问省略了主语（例如，上文在聊“宫保鸡丁”，最新提问是“卡路里高吗？”），必须重写为“宫保鸡丁的卡路里高吗？”。
+3. 保持原意：如果最新提问已经是一个完整的独立问题，且不需要任何历史背景也能看懂，请【直接原样输出】，绝不要做任何画蛇添足的修改。
+4. 严禁回答问题：你只是一个翻译官！绝不允许尝试回答用户的问题！
+5. 纯净输出：直接输出重写后的文本，绝不允许包含诸如“重写后：”、“查询：”或引号等任何附加格式。"""
+
+
+        history_str = ""
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                history_str += f"用户说: {msg.content}\n"
+            elif isinstance(msg, AIMessage):
+                history_str += f"美食助手说: {msg.content}\n"
+
+        # 构造给大模型的完整 Prompt
+        final_prompt = f"""
+{rewrite_system_prompt}
+
+【历史对话记录】：
+{history_str}
+
+【最新提问】：
+{state['query']}"""
+
+        llm_input = [SystemMessage(content=final_prompt)]
+
+        response = await self.llm.ainvoke(
+            input=llm_input, 
+            temperature=0.1,  # 💡 重写任务需要极低的温度，保证确定性和稳定性
+        )
+
+        rewritten_query = response.content.strip()
+        logger.info(f"原始查询: {state['query']} | 重写后查询: {rewritten_query}")
+
+        return {'query': rewritten_query, 'messages': [HumanMessage(content=state['query'])]} # 不适合将重写的结果传入历史对话
+
 
     class MultiQueryComposer(BaseModel):
         """用于将用户的查询分解为一个或多个子查询，方便后续检索"""
@@ -187,12 +262,14 @@ class MainGraph:
         branch_graph = self.compiled_subgraph.compile_subgraph()  # 生成编译好的子图节点
 
         builder = StateGraph(MainState)
+        builder.add_node('query_rewrite_history', self.query_rewrite_history)
         builder.add_node('multi_query_composer', self.multi_query_composer)
         builder.add_node('multi_query_router', self.multi_query_router)
         builder.add_node('generate_subquery', branch_graph)
         builder.add_node('generate', self.generate_answer)
 
-        builder.add_edge(START, 'multi_query_composer')
+        builder.add_edge(START, 'query_rewrite_history')
+        builder.add_edge('query_rewrite_history', 'multi_query_composer')
         builder.add_edge('multi_query_composer', 'multi_query_router')
         builder.add_conditional_edges(
             source='multi_query_router',

@@ -73,5 +73,6 @@ rag/
 *.key
 *.secret
 
-# Qdrant
+# database
 qdrant_data/
+mongodb_data

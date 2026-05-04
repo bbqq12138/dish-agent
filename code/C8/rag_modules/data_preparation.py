@@ -5,12 +5,14 @@
 import logging
 import hashlib
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Literal
 
 from langchain_text_splitters import MarkdownHeaderTextSplitter
 from langchain_core.documents import Document
 from pathlib import Path
 import uuid
+
+from .myMongDB import MyMongoDB
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +43,29 @@ class DataPreparationModule:
         self.data_path = data_path
         self.documents: List[Document] = []  # 父文档（完整食谱）
         self.chunks: List[Document] = []     # 子文档（按标题分割的小块）
-        self.document_id_map: Dict[str, int] = {}  # 文档ID -> batch_index的映射（用于后续批次处理）
-        self.chunk_id_map: Dict[str, int] = {}  # chunk_id -> batch_index的映射（用于后续批次处理）
+        self.myMongodb: MyMongoDB | None = None  # MongoDB连接实例
+        self.docs_collection: str = ""
+        self.chunks_collection: str = ""
+
+    @classmethod
+    async def create(cls, data_path: str, mongodb_uri: str, mongodb_database: str, docs_collection: str, chunks_collection: str) -> 'DataPreparationModule':
+        """工厂方法创建DataPreparationModule实例"""
+        instance = cls(data_path)
+        instance.myMongodb = await MyMongoDB.create(mongodb_uri, mongodb_database)
+        instance.docs_collection = docs_collection
+        instance.chunks_collection = chunks_collection
+        return instance
     
+
+    async def inspect_mongodb_strore(self, collection: str) -> bool:
+        """检查MongoDB中是否已经存在文档和块数据"""
+        if not self.myMongodb:
+            raise ValueError("MongoDB连接未初始化")
+
+        doc_count = await self.myMongodb.get_collection_count(collection)
+        return doc_count > 0
+
+
     def load_documents(self) -> List[Document]:
         """
         加载文档数据
@@ -51,10 +73,14 @@ class DataPreparationModule:
         Returns:
             加载的文档列表
         """
+        if self.documents:
+            return self.documents  # 已经加载过了，直接返回缓存的文档列表
+        
         logger.info(f"正在从 {self.data_path} 加载文档...")
         
         # 直接读取Markdown文件以保持原始格式
         documents = []
+        document_id_set = set()  # 用于检测重复文档ID
         data_path_obj = Path(self.data_path)
 
         for md_file in data_path_obj.rglob("*.md"):
@@ -71,6 +97,11 @@ class DataPreparationModule:
                     relative_path = Path(md_file).as_posix()
                 parent_id = hashlib.md5(relative_path.encode("utf-8")).hexdigest()
 
+                # 检测重复文档ID
+                if parent_id in document_id_set:
+                    continue  # 跳过重复文档
+                document_id_set.add(parent_id)
+
                 # 创建Document对象
                 doc = Document(
                     page_content=content,
@@ -81,7 +112,6 @@ class DataPreparationModule:
                     }
                 )
                 documents.append(doc)
-                self.document_id_map[parent_id] = len(documents) - 1  # 更新文档ID到batch_index的映射
 
             except Exception as e:
                 logger.warning(f"读取文件 {md_file} 失败: {e}")
@@ -146,22 +176,38 @@ class DataPreparationModule:
         Returns:
             分块后的文档列表
         """
+        if self.chunks:
+            return self.chunks  # 已经分块过了，直接返回缓存的块列表
+        
         logger.info("正在进行Markdown结构感知分块...")
 
         if not self.documents:
             raise ValueError("请先加载文档")
 
+
         # 使用Markdown标题分割器
-        chunks = self._markdown_header_split()
+        _chunks = self._markdown_header_split()
+
 
         # 为每个chunk添加基础元数据
-        for i, chunk in enumerate(chunks):
+        chunk_id_set = set()  # 用于检测重复chunk_id
+        chunks = []
+        for i, chunk in enumerate(_chunks):
             if 'chunk_id' not in chunk.metadata:
                 # 如果没有chunk_id（比如分割失败的情况），则生成一个
-                chunk.metadata['chunk_id'] = str(uuid.uuid4())
+                chunk_flag = chunk.page_content[:50]  # 取内容前50字符作为标识
+                chunk.metadata['chunk_id'] = hashlib.md5(chunk_flag.encode("utf-8")).hexdigest()
+
+            # 检测重复chunk_id
+            if chunk.metadata['chunk_id'] in chunk_id_set:
+                continue  # 跳过重复chunk
+            chunk_id_set.add(chunk.metadata['chunk_id'])
+            
             chunk.metadata['batch_index'] = i  # 在当前批次中的索引
             chunk.metadata['chunk_size'] = len(chunk.page_content)
-            self.chunk_id_map[chunk.metadata['chunk_id']] = i  # 更新chunk_id到batch_index的映射
+
+            chunks.append(chunk)
+
 
         self.chunks = chunks
         logger.info(f"Markdown分块完成，共生成 {len(chunks)} 个chunk")
@@ -235,61 +281,25 @@ class DataPreparationModule:
                 # 如果Markdown分割失败，将整个文档作为一个chunk
                 all_chunks.append(doc)
 
-        logger.info(f"Markdown结构分割完成，生成 {len(all_chunks)} 个结构化块")
         return all_chunks
 
-    def filter_documents_by_category(self, category: str) -> List[Document]:
-        """
-        按分类过滤文档
-        
-        Args:
-            category: 菜品分类
-            
-        Returns:
-            过滤后的文档列表
-        """
-        return [doc for doc in self.documents if doc.metadata.get('category') == category]
     
-    def filter_documents_by_difficulty(self, difficulty: str) -> List[Document]:
-        """
-        按难度过滤文档
-        
-        Args:
-            difficulty: 难度等级
-            
-        Returns:
-            过滤后的文档列表
-        """
-        return [doc for doc in self.documents if doc.metadata.get('difficulty') == difficulty]
-    
-    def get_statistics(self) -> Dict[str, Any]:
+    async def get_statistics(self) -> Dict[str, Any]:
         """
         获取数据统计信息
 
         Returns:
             统计信息字典
         """
-        if not self.documents:
+        if not self.myMongodb:
             return {}
 
-        categories = {}
-        difficulties = {}
-
-        for doc in self.documents:
-            # 统计分类
-            category = doc.metadata.get('category', '未知')
-            categories[category] = categories.get(category, 0) + 1
-
-            # 统计难度
-            difficulty = doc.metadata.get('difficulty', '未知')
-            difficulties[difficulty] = difficulties.get(difficulty, 0) + 1
-
         return {
-            'total_documents': len(self.documents),
-            'total_chunks': len(self.chunks),
-            'categories': categories,
-            'difficulties': difficulties,
-            'avg_chunk_size': sum(chunk.metadata.get('chunk_size', 0) for chunk in self.chunks) / len(self.chunks) if self.chunks else 0
+            'total_documents': await self.myMongodb.get_collection_count(self.docs_collection),
+            'total_chunks': await self.myMongodb.get_collection_count(self.chunks_collection),
+            'categories': await self.myMongodb.distinct_values(self.docs_collection, 'category'),
+            'difficulties': await self.myMongodb.distinct_values(self.docs_collection, 'difficulty'),
+            # 'avg_chunk_size': sum(chunk.metadata.get('chunk_size', 0) for chunk in self.chunks) / len(self.chunks) if self.chunks else 0
         }
     
     def export_metadata(self, output_path: str):
@@ -300,6 +310,9 @@ class DataPreparationModule:
             output_path: 输出文件路径
         """
         import json
+
+        if not self.documents:
+            self.documents = self.load_documents()
         
         metadata_list = []
         for doc in self.documents:
@@ -316,7 +329,7 @@ class DataPreparationModule:
         
         logger.info(f"元数据已导出到: {output_path}")
 
-    def get_chunks(self, chunk_ids: List[str]) -> List[Document]:
+    async def get_chunks(self, chunk_ids: List[str]) -> List[Document]:
         """
         根据chunk_id获取对应的子块文档
         
@@ -326,65 +339,98 @@ class DataPreparationModule:
         Returns:
             对应的子块文档列表
         """
-        # 注意：返回副本而不是直接返回 self.chunks 中的缓存对象。
+        # 注意：返回的是新创建的Document而不是直接返回 self.chunks 中的缓存对象。
         # 下游检索/重排过程会写 metadata（例如 rrf_score / rerank_score），
         # 若直接返回缓存对象会导致不同查询之间相互覆盖，且并发时存在竞态。
-        result_chunks: List[Document] = []
-        for chunk_id in chunk_ids:
-            if chunk_id not in self.chunk_id_map:
-                continue
-            src = self.chunks[self.chunk_id_map[chunk_id]]
-            result_chunks.append(
-                Document(
-                    page_content=src.page_content,
-                    metadata=dict(src.metadata),
-                )
-            )
+        if not self.myMongodb:
+            raise ValueError("MongoDB连接未初始化")
+
+        query_fliter = {'_id': {'$in': chunk_ids}}
+        chunk_items = await self.myMongodb.find_many(self.chunks_collection, query_fliter)
+        result_chunks = self._mongodb_to_document(chunk_items, id_name='chunk_id') or []
         return result_chunks
 
     async def get_documents(self, parent_ids: List[str]) -> List[Document]:
         """
-        根据子块返回的父文档ids来获取对应的父文档（智能去重）
+        根据子块返回的父文档ids来获取对应的父文档
 
         Args:
             parent_ids: 父文档ID列表
 
         Returns:
-            对应的父文档列表（去重，按相关性排序）
+            对应的父文档列表(去重)
         """
-        # 统计每个父文档被匹配的次数（相关性指标）
-        parent_relevance = {}
-        parent_docs_map = {}
-
-        # 收集所有相关的父文档ID和相关性分数
-        for parent_id in parent_ids:
-            if parent_id:
-                # 增加相关性计数
-                parent_relevance[parent_id] = parent_relevance.get(parent_id, 0) + 1
-
-                # 缓存父文档（避免重复查找）
-                if parent_id not in parent_docs_map:
-                    parent_docs_map[parent_id] = self.documents[self.document_id_map[parent_id]]
+        if not self.myMongodb:
+            raise ValueError("MongoDB连接未初始化")
         
+        parent_ids = list(set(parent_ids))  # 去重父文档ID列表
 
-        # 按相关性排序（匹配次数多的排在前面）
-        sorted_parent_ids = sorted(parent_relevance.keys(),
-                                 key=lambda x: parent_relevance[x],
-                                 reverse=True)
+        query_fliter = {'_id': {'$in': parent_ids}}
+        doc_items = await self.myMongodb.find_many(self.docs_collection, query_fliter)
+        parent_docs = self._mongodb_to_document(doc_items, id_name='parent_id') or []
 
-        # 构建去重后的父文档列表
-        parent_docs = []
-        for parent_id in sorted_parent_ids:
-            if parent_id in parent_docs_map:
-                parent_docs.append(parent_docs_map[parent_id])
 
         # 收集父文档名称和相关性信息用于日志
         parent_info = []
         for doc in parent_docs:
             dish_name = doc.metadata.get('dish_name', '未知菜品')
             parent_id = doc.metadata.get('parent_id')
-            relevance_count = parent_relevance.get(parent_id, 0)
-            parent_info.append(f"{dish_name}({relevance_count}块)")
+            parent_info.append(f"{dish_name}(ID: {parent_id})")
 
         logger.debug(f"从 {len(parent_ids)} 个子块中找到 {len(parent_docs)} 个去重父文档: {', '.join(parent_info)}")
+
         return parent_docs
+
+
+    def _mongodb_to_document(self, items: list[dict], id_name: Literal['parent_id', 'chunk_id']) -> list[Document]:
+        documents = []
+        for item in items:
+            content = item.get('raw_content', '')
+            metadata = {}
+            for k, v in item.items():
+                if k == '_id':
+                    metadata[id_name] = v
+                elif k != 'raw_content':
+                    metadata[k] = v
+            documents.append(Document(page_content=content, metadata=metadata))
+        return documents
+
+
+    async def save_documents_to_mongodb(self, collection_name: str):
+        """将父文档保存到MongoDB"""
+        if not self.myMongodb:
+            raise ValueError("MongoDB连接未初始化")
+        
+        if not self.documents:
+            self.documents = self.load_documents()
+        
+        insert_items = [{
+            '_id': doc.metadata['parent_id'], 
+            'dish_name': doc.metadata['dish_name'], 
+            'category': doc.metadata['category'], 
+            'difficulty': doc.metadata['difficulty'], 
+            'raw_content': doc.page_content
+        } for doc in self.documents]
+
+        await self.myMongodb.insert_many(collection_name, insert_items)
+
+
+    async def save_chunks_to_mongodb(self, collection_name: str):
+        if not self.myMongodb:
+            raise ValueError("MongoDB连接未初始化")
+        if not self.chunks:
+            self.load_documents()
+            self.chunks = self.chunk_documents()
+
+        insert_items = [{
+            '_id': chunk.metadata['chunk_id'], 
+            'parent_id': chunk.metadata['parent_id'], 
+            'dish_name': chunk.metadata['dish_name'], 
+            'category': chunk.metadata['category'], 
+            'difficulty': chunk.metadata['difficulty'], 
+            'chunk_index': chunk.metadata['chunk_index'], 
+            'chunk_size': chunk.metadata['chunk_size'], 
+            'raw_content': chunk.page_content
+        } for chunk in self.chunks]
+
+        await self.myMongodb.insert_many(collection_name, insert_items)

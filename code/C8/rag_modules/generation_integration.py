@@ -2,12 +2,11 @@
 生成集成模块
 """
 
-import json
 import logging
 from typing import List
 
 from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, AIMessage
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
@@ -28,15 +27,16 @@ class GenerationIntegrationModule:
         self.llm = llm
 
     @staticmethod
-    async def multi_query_summary(tagged_llm, query: str, relevant_docs: list[Document] | list[str]) -> str:
+    async def multi_query_summary(tagged_llm, query: str, relevant_docs: list[Document] | list[str]) -> AIMessage:
         context = "\n\n".join(list(doc.page_content if isinstance(doc, Document) else doc for doc in relevant_docs))
 
         prompt = f"""
 你是一个美食系统的智能助手，美食系统负责回答用户关于菜品推荐、菜谱生成、菜品问答三方面的提问。
-你的任务是根据用户的查询和相关的查询结果，生成一个最终的回答。
+你的任务是根据用户的查询和相关的检索结果，生成一个最终的回答。
+若用户有多个查询，请分别给出回答。
 
 
-相关查询结果：
+相关检索结果：
 {context}"""
         
         final_answer = await tagged_llm.ainvoke(
@@ -47,7 +47,7 @@ class GenerationIntegrationModule:
             temperature=0.7
         )
 
-        return final_answer.content
+        return final_answer
     
 
     async def query_rewrite(self, query: str) -> str:
@@ -166,7 +166,7 @@ class GenerationIntegrationModule:
 
     
     @classmethod
-    async def generate_list_answer(cls, tagged_llm, query: str, context_docs: List[Document]) -> str:
+    async def generate_list_answer(cls, tagged_llm, query: str, context_docs: List[Document]) -> AIMessage:
         """
         生成列表式回答 - 适用于推荐类查询
 
@@ -199,16 +199,16 @@ class GenerationIntegrationModule:
 
 用户问题: {query}"""
         
-        result = await tagged_llm.ainvoke(
+        response = await tagged_llm.ainvoke(
             input=[SystemMessage(content=list_answer_prompt)], 
             temperature=0.6, 
         )
 
-        return result.content
+        return response
 
 
     @classmethod
-    async def generate_step_by_step_answer(cls, tagged_llm, query: str, context_docs: List[Document]) -> str:
+    async def generate_step_by_step_answer(cls, tagged_llm, query: str, context_docs: List[Document]) -> AIMessage:
         """
         生成分步骤回答
 
@@ -255,11 +255,11 @@ class GenerationIntegrationModule:
             temperature=0.6,
         )
 
-        return response.content
+        return response
     
 
     @classmethod
-    async def generate_basic_answer(cls, tagged_llm, query: str, context_docs: List[Document]) -> str:
+    async def generate_basic_answer(cls, tagged_llm, query: str, context_docs: List[Document]) -> AIMessage:
         """
         生成基础回答
 
@@ -289,8 +289,7 @@ class GenerationIntegrationModule:
             temperature=0.6,
         )
 
-        return response.content
-    
+        return response
 
 
     @staticmethod

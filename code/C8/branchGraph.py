@@ -1,6 +1,7 @@
 from langgraph.graph import MessagesState, StateGraph, START, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import tool_node
+from langchain_core.callbacks.manager import dispatch_custom_event
 
 from langchain_core.documents import Document
 from langchain_core.runnables.config import RunnableConfig
@@ -17,6 +18,7 @@ from rag_modules import (
 logger = logging.getLogger(__name__)
 
 
+# PS：子图最终会将自己的全局状态返回给主图，主图提取出相同的字段并进行合并（合并逻辑依照主图中该字段的定义）
 class BranchState(MessagesState):
         subquery: str
         num_sub_queries: int
@@ -24,6 +26,7 @@ class BranchState(MessagesState):
         relevant_chunks: list[Document]
         relevant_docs: list[Document]
         branch_results: list[str]  # 子图没有这个字段，则会自动过滤掉这个字段，所以不会传入主图。因此在子图最后一节点中附加这个字段并返回
+        relevant_docs_total: int  # 统计当前分支检索到的相关文档数量，主图会自动累加这个字段来统计总数
 
 
 class SubGraph:
@@ -146,7 +149,7 @@ class SubGraph:
         else:
             logger.debug(f"[分支{state['subquery']}] ❌ 未能找到对应的父文档。")
         
-        return {'relevant_docs': relevant_docs}
+        return {'relevant_docs': relevant_docs, 'relevant_docs_total': len(relevant_docs)}
 
 
     async def generate_sub_answer(self, state: BranchState, config: RunnableConfig) -> dict:
@@ -164,6 +167,11 @@ class SubGraph:
 
         if state['num_sub_queries'] <= 1:
             tagged_llm = self.llm.with_config(tags=stream_output_tags)
+            dispatch_custom_event(
+                name="docs_num_info",
+                data={"relevant_docs_total": len(relevant_docs)},
+                config=config
+            )
         else: tagged_llm = self.llm
 
         # 6. 根据路由类型选择回答方式
@@ -177,12 +185,9 @@ class SubGraph:
         else:
             response = await GenerationIntegrationModule.generate_basic_answer(
                 tagged_llm, question, relevant_docs)
+            
+        if state['num_sub_queries'] <= 1:
+            return {"branch_results": response.content, "messages": [response]}
+        else:
+            return {"branch_results": response.content}  # 返回当前分支的结果，主图会自动合并结果
 
-        return {"branch_results": response}
-
-
-    async def test_branch_node(self, state: BranchState):
-        """测试子图节点的调用"""
-        result = f"子查询: {state['subquery']}, 查询类型: {state['query_category']}"
-        logger.info(result)
-        return {'branch_results': [result]}  # 注意这里必须返回这个字段，主图才会接收到这个字段并进行合并。子图要是没有这个字段，主图就会自动过滤掉这个字段，不会传入主图
